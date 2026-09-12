@@ -132,7 +132,7 @@ namespace AnimationEditor.Core.CommandsAndState
         void MatchRectanglesToFrames(List<AARectSave> rectangles);
         void DeleteCircle(CircleSave circle, AnimationFrameSave owner);
         void DeleteAxisAlignedRectangle(AARectSave rectangle, AnimationFrameSave owner);
-        void DeleteShapes(AnimationFrameSave frame, List<AARectSave> rectangles, List<CircleSave> circles);
+        void DeleteShapes(List<AARectSave> rectangles, List<CircleSave> circles);
         void DeleteFrames(List<AnimationFrameSave> frames);
         Task AddAnimationChain();
         AnimationChainSave? AddAnimationChainWithName(string name);
@@ -425,6 +425,12 @@ namespace AnimationEditor.Core.CommandsAndState
 
         /// <summary>Adds multiple clipboard shapes to <paramref name="frame"/> in one undo step.</summary>
         void PasteShapes(AnimationFrameSave frame, IReadOnlyList<AARectSave> rectangles,
+            IReadOnlyList<CircleSave> circles);
+
+        /// <summary>Adds multiple clipboard shapes to every frame in <paramref name="frames"/> in one
+        /// undo step — each frame gets its own independent clone. Frames in a locked chain are
+        /// skipped (bulk skip-locked-entries), same as other multi-target paste/delete operations.</summary>
+        void PasteShapes(IReadOnlyList<AnimationFrameSave> frames, IReadOnlyList<AARectSave> rectangles,
             IReadOnlyList<CircleSave> circles);
 
         /// <summary>Paste chains then remove <paramref name="sourcesToRemove"/> in one undo step.</summary>

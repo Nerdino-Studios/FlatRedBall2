@@ -197,6 +197,42 @@ public class GlueTiledTests
             d => d.Message.Contains("FromLayer") && d.Message.Contains("does not support"));
     }
 
+    // FRB1's TileEntityInstantiator.ApplyPropertiesTo tries every one of a tile's properties against
+    // the entity via reflection and silently drops whichever don't match an existing member. A loaded
+    // GlueEntity has no compiled members for its authored variables, so the FRB2 equivalent of "an
+    // existing member" is a declared CustomVariable by that name -- StandardTileset's SolidCollision
+    // tile (id 0) carries a real "Worth" property for this reason, rather than an arranged one.
+    [Fact]
+    public void CreateEntitiesFromTiles_ATilePropertyMatchingACustomVariable_AppliesItToTheSpawnedEntity()
+    {
+        if (!_graphics.IsAvailable)
+            return;
+
+        var project = GlueProject.Load(
+            Path.Combine(AppContext.BaseDirectory, "Glue", "Fixtures", "DoorsDemo", "DoorsDemo.gluj"),
+            new GlueContentSource(
+                _graphics.ContentLoader!, Path.Combine("Glue", "Fixtures", "DoorsDemo", "Content"),
+                _graphics.GraphicsDevice));
+
+        var door = project.FindEntity(@"Entities\Door")!;
+        door.Name = @"Entities\SolidCollision";
+        door.CustomVariables.Add(new CustomVariable { Name = "Worth" });
+
+        var engine = new FlatRedBallService();
+        engine.GlueProject = project;
+        engine.Start<GlueScreen>(s =>
+        {
+            s.Save = project.FindScreen(@"Screens\Level1");
+            s.Project = project;
+        });
+
+        var spawned = project.InstancesOf(@"Entities\SolidCollision");
+
+        spawned.ShouldNotBeEmpty();
+        foreach (var instance in spawned)
+            instance.Get<int>("Worth").ShouldBe(50);
+    }
+
     // Glue spawns an entity for every tile whose type names one. No vendored map paints a tile typed
     // after an entity -- DoorsDemo places its doors as NamedObjects -- so the rule is exercised by
     // renaming a real entity to match a tile type the map really does use. The tiles, the lookup and
@@ -433,6 +469,85 @@ public class GlueTiledTests
 
         screen.Objects.ShouldContainKey("Map");
         screen.Objects["Map"].ShouldBeOfType<TileMap>();
+    }
+
+    // FromMapCollision clones an already-built TileShapeCollection out of the map's own Collisions
+    // list, keyed by tile Class (TmxCollisionName) — the same source FromType queries on demand via
+    // CollisionTileTypeName. It is not object-layer geometry: confirmed against FRB1's own
+    // TileShapeCollectionCodeGenerator.GenerateFromMapCollision (map.Collisions.FirstOrDefault by
+    // name) and against real KidDefense data, whose FromMapCollision collections set
+    // TmxCollisionName to the same tile-type string as a sibling CollisionTileTypeName property.
+    private static NamedObjectSave MapCollisionSave(string instanceName, string? tmxCollisionName)
+    {
+        var save = new NamedObjectSave
+        {
+            InstanceName = instanceName,
+            SourceClassType = "FlatRedBall.TileCollisions.TileShapeCollection",
+            SourceType = SourceType.FlatRedBallType,
+        };
+        save.Properties.Add(new PropertySave
+        {
+            Name = "SourceTmxName",
+            Value = JsonDocument.Parse("\"Map\"").RootElement,
+        });
+        // 6 is CollisionCreationOptions.FromMapCollision.
+        save.Properties.Add(new PropertySave
+        {
+            Name = "CollisionCreationOptions",
+            Value = JsonDocument.Parse("6").RootElement,
+        });
+        if (tmxCollisionName is not null)
+        {
+            save.Properties.Add(new PropertySave
+            {
+                Name = "TmxCollisionName",
+                Value = JsonDocument.Parse($"\"{tmxCollisionName}\"").RootElement,
+            });
+        }
+        return save;
+    }
+
+    [Fact]
+    public void BuildObjects_ACollectionFromMapCollision_BuildsTheSameShapesAsFromType()
+    {
+        // Level1's own "SolidCollision" object already builds via FromType + CollisionTileTypeName
+        // "SolidCollision" (see Level1.glsj). A second collection built via FromMapCollision +
+        // TmxCollisionName "SolidCollision" must land on the exact same tiles.
+        var screen = Level1With(MapCollisionSave("SolidCollisionViaMapCollision", "SolidCollision"));
+        if (screen is null)
+            return;
+
+        var map = (TileMap)screen.Objects["Map"];
+        var fromType = (TileShapes)screen.Objects["SolidCollision"];
+        var fromMapCollision = screen.Objects["SolidCollisionViaMapCollision"].ShouldBeOfType<TileShapes>();
+
+        int columns = (int)(map.Width / map.TileWidth) + 1;
+        int rows = (int)(map.Height / map.TileHeight) + 1;
+        int matched = 0;
+
+        for (int col = -columns; col <= columns; col++)
+        {
+            for (int row = -rows; row <= rows; row++)
+            {
+                bool hasTile = fromType.GetTileAtCell(col, row) is not null;
+                (fromMapCollision.GetTileAtCell(col, row) is not null).ShouldBe(hasTile);
+                if (hasTile)
+                    matched++;
+            }
+        }
+
+        matched.ShouldBeGreaterThan(0, "the fixture's map has SolidCollision tiles, so some must match");
+    }
+
+    [Fact]
+    public void BuildObjects_AMapCollisionNamingNoType_WarnsRatherThanBuilding()
+    {
+        var screen = Level1With(MapCollisionSave("SolidCollisionViaMapCollision", tmxCollisionName: null));
+        if (screen is null)
+            return;
+
+        screen.Objects.ShouldNotContainKey("SolidCollisionViaMapCollision");
+        screen.BuildDiagnostics.ShouldContain(d => d.Message.Contains("names none"));
     }
 
     [Fact]

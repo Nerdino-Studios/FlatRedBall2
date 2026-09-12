@@ -27,7 +27,14 @@ public static class GlueTypeMap
         ["FlatRedBall.Math.Geometry.AxisAlignedRectangle"] = static () => new Collision.AARect(),
         ["FlatRedBall.Math.Geometry.Circle"] = static () => new Collision.Circle(),
         ["FlatRedBall.Math.Geometry.Polygon"] = static () => new Collision.Polygon(),
+        ["FlatRedBall.Math.Geometry.Line"] = static () => new Collision.Line(),
         ["FlatRedBall.Entities.CameraControllingEntity"] = static () => new Entities.CameraControllingEntity(),
+        // A bare PositionedObject is an attachment anchor with no visual — Entity is the equivalent:
+        // position/attachment with no required shape or sprite.
+        ["FlatRedBall.PositionedObject"] = static () => new Entity(),
+        // Constructed with a placeholder name: GlueObjectBuilder.Create overwrites it with the
+        // object's own InstanceName once built, since a parameterless factory has no way to see it.
+        ["FlatRedBall.Graphics.Layer"] = static () => new Rendering.Layer(string.Empty),
     };
 
     private static readonly Dictionary<string, Type> TypesByGlueName = new(StringComparer.Ordinal)
@@ -36,7 +43,10 @@ public static class GlueTypeMap
         ["FlatRedBall.Math.Geometry.AxisAlignedRectangle"] = typeof(Collision.AARect),
         ["FlatRedBall.Math.Geometry.Circle"] = typeof(Collision.Circle),
         ["FlatRedBall.Math.Geometry.Polygon"] = typeof(Collision.Polygon),
+        ["FlatRedBall.Math.Geometry.Line"] = typeof(Collision.Line),
         ["FlatRedBall.Entities.CameraControllingEntity"] = typeof(Entities.CameraControllingEntity),
+        ["FlatRedBall.PositionedObject"] = typeof(Entity),
+        ["FlatRedBall.Graphics.Layer"] = typeof(Rendering.Layer),
     };
 
     /// <summary>
@@ -56,6 +66,7 @@ public static class GlueTypeMap
         ["AxisAlignedRectangle"] = "FlatRedBall.Math.Geometry.AxisAlignedRectangle",
         ["Circle"] = "FlatRedBall.Math.Geometry.Circle",
         ["Polygon"] = "FlatRedBall.Math.Geometry.Polygon",
+        ["Layer"] = "FlatRedBall.Graphics.Layer",
     };
 
     private static string Canonical(string openTypeName) =>

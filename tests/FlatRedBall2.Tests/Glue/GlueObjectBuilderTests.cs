@@ -3,9 +3,12 @@ using System.Text.Json;
 using FlatRedBall2.Collision;
 using FlatRedBall2.Glue;
 using FlatRedBall2.Glue.Model;
+using FlatRedBall2.Rendering;
+using FlatRedBall2.Tiled;
 using Shouldly;
 using Xunit;
 using XnaColor = Microsoft.Xna.Framework.Color;
+using XnaRectangle = Microsoft.Xna.Framework.Rectangle;
 
 namespace FlatRedBall2.Tests.Glue;
 
@@ -20,6 +23,49 @@ public class GlueObjectBuilderTests
     {
         var diagnostics = new List<GlueLoadDiagnostic>();
         return (new GlueObjectBuilder(diagnostics), diagnostics);
+    }
+
+    [Fact]
+    public void ApplyInstructions_ShiftMapToMoveGameplayLayerToZ0OnATileMap_DoesNotWarnAndLeavesGameplayLayerAtZ0()
+    {
+        // FRB1 generates code that shifts the whole map's Z so "GameplayLayer" lands at Z = 0.
+        // FRB2's TileMap does this unconditionally on every load (AssignDefaultZ), so the instruction
+        // has nothing to write to but nothing left to do either — it should be consumed, not warned
+        // about. "Background" ahead of it in TMX order gives GameplayLayer a nonzero index to shift
+        // away from, so the assertion is not trivially true regardless of the fix.
+        var (builder, diagnostics) = NewBuilder();
+        var layers = new List<TileMapLayer> { new("Background"), new("GameplayLayer") };
+        var map = new TileMap(width: 160f, height: 160f, tileWidth: 16, tileHeight: 16, layers);
+        var save = Save(@"{
+            ""InstanceName"": ""Map"",
+            ""InstructionSaves"": [
+                { ""Type"": ""bool"", ""Member"": ""ShiftMapToMoveGameplayLayerToZ0"", ""Value"": true }
+            ]
+        }");
+
+        builder.ApplyInstructions(map, save, elementName: null);
+
+        diagnostics.ShouldBeEmpty();
+        map.GetLayer("GameplayLayer").Z.ShouldBe(0f);
+    }
+
+    [Fact]
+    public void ApplyInstructions_ShiftMapToMoveGameplayLayerToZ0OnANonTileMap_StillWarns()
+    {
+        // The no-op is scoped to TileMap specifically -- on any other instance the name is still an
+        // unrecognized member and should warn like any other, so a real typo elsewhere isn't masked.
+        var (builder, diagnostics) = NewBuilder();
+        var save = Save(@"{
+            ""InstanceName"": ""CircleInstance"",
+            ""SourceClassType"": ""FlatRedBall.Math.Geometry.Circle"",
+            ""InstructionSaves"": [
+                { ""Type"": ""bool"", ""Member"": ""ShiftMapToMoveGameplayLayerToZ0"", ""Value"": true }
+            ]
+        }");
+
+        builder.Create(save).ShouldNotBeNull();
+
+        diagnostics.ShouldContain(d => d.Message.Contains("ShiftMapToMoveGameplayLayerToZ0"));
     }
 
     [Fact]
@@ -42,6 +88,46 @@ public class GlueObjectBuilderTests
         var circle = (Circle)builder.Create(save)!;
 
         circle.X.ShouldBe(500f);
+        diagnostics.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void Create_AllFourTexturePixelInstructionsInReverseOrder_ProduceCombinedSourceRectangle()
+    {
+        // Right/Bottom are authored before Left/Top to confirm the edges combine into the same
+        // rectangle regardless of instruction order, since Glue does not guarantee ordering.
+        var (builder, diagnostics) = NewBuilder();
+        var save = Save(@"{
+            ""InstanceName"": ""SpriteInstance"",
+            ""SourceClassType"": ""FlatRedBall.Sprite"",
+            ""InstructionSaves"": [
+                { ""Type"": ""float"", ""Member"": ""RightTexturePixel"", ""Value"": 54.0 },
+                { ""Type"": ""float"", ""Member"": ""BottomTexturePixel"", ""Value"": 37.0 },
+                { ""Type"": ""float"", ""Member"": ""LeftTexturePixel"", ""Value"": 10.0 },
+                { ""Type"": ""float"", ""Member"": ""TopTexturePixel"", ""Value"": 5.0 }
+            ]
+        }");
+
+        var sprite = (Sprite)builder.Create(save)!;
+
+        sprite.SourceRectangle.ShouldBe(new XnaRectangle(10, 5, 44, 32));
+        diagnostics.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void Create_BottomTexturePixelInstruction_SetsSourceRectangleBottomEdge()
+    {
+        var (builder, diagnostics) = NewBuilder();
+        var save = Save(@"{
+            ""InstanceName"": ""SpriteInstance"",
+            ""SourceClassType"": ""FlatRedBall.Sprite"",
+            ""InstructionSaves"": [ { ""Type"": ""float"", ""Member"": ""BottomTexturePixel"", ""Value"": 37.0 } ]
+        }");
+
+        var sprite = (Sprite)builder.Create(save)!;
+
+        sprite.SourceRectangle!.Value.Y.ShouldBe(0);
+        sprite.SourceRectangle!.Value.Height.ShouldBe(37);
         diagnostics.ShouldBeEmpty();
     }
 
@@ -73,6 +159,22 @@ public class GlueObjectBuilderTests
     }
 
     [Fact]
+    public void Create_LeftTexturePixelInstruction_SetsSourceRectangleLeftEdge()
+    {
+        var (builder, diagnostics) = NewBuilder();
+        var save = Save(@"{
+            ""InstanceName"": ""SpriteInstance"",
+            ""SourceClassType"": ""FlatRedBall.Sprite"",
+            ""InstructionSaves"": [ { ""Type"": ""float"", ""Member"": ""LeftTexturePixel"", ""Value"": 10.0 } ]
+        }");
+
+        var sprite = (Sprite)builder.Create(save)!;
+
+        sprite.SourceRectangle!.Value.X.ShouldBe(10);
+        diagnostics.ShouldBeEmpty();
+    }
+
+    [Fact]
     public void Create_RadiusInstruction_IsApplied()
     {
         var (builder, _) = NewBuilder();
@@ -88,6 +190,40 @@ public class GlueObjectBuilderTests
     }
 
     [Fact]
+    public void Create_RightTexturePixelInstruction_SetsSourceRectangleWidthFromOrigin()
+    {
+        var (builder, diagnostics) = NewBuilder();
+        var save = Save(@"{
+            ""InstanceName"": ""SpriteInstance"",
+            ""SourceClassType"": ""FlatRedBall.Sprite"",
+            ""InstructionSaves"": [ { ""Type"": ""float"", ""Member"": ""RightTexturePixel"", ""Value"": 54.0 } ]
+        }");
+
+        var sprite = (Sprite)builder.Create(save)!;
+
+        sprite.SourceRectangle!.Value.X.ShouldBe(0);
+        sprite.SourceRectangle!.Value.Width.ShouldBe(54);
+        diagnostics.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void Create_RotationZInstruction_MapsOntoRotationInRadians()
+    {
+        // Glue's member is "RotationZ" (a raw radian float); FRB2's is "Rotation" (an Angle).
+        var (builder, diagnostics) = NewBuilder();
+        var save = Save(@"{
+            ""InstanceName"": ""SpriteInstance"",
+            ""SourceClassType"": ""FlatRedBall.Sprite"",
+            ""InstructionSaves"": [ { ""Type"": ""float"", ""Member"": ""RotationZ"", ""Value"": 1.5707963267948966 } ]
+        }");
+
+        var sprite = (Sprite)builder.Create(save)!;
+
+        sprite.Rotation.Radians.ShouldBe(1.5707963f, tolerance: 0.0001f);
+        diagnostics.ShouldBeEmpty();
+    }
+
+    [Fact]
     public void Create_Shape_IsVisibleByDefault()
     {
         // FRB2 shapes default to invisible because they are primarily collision volumes. A shape
@@ -100,6 +236,22 @@ public class GlueObjectBuilderTests
         }");
 
         ((AARect)builder.Create(save)!).IsVisible.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void Create_TopTexturePixelInstruction_SetsSourceRectangleTopEdge()
+    {
+        var (builder, diagnostics) = NewBuilder();
+        var save = Save(@"{
+            ""InstanceName"": ""SpriteInstance"",
+            ""SourceClassType"": ""FlatRedBall.Sprite"",
+            ""InstructionSaves"": [ { ""Type"": ""float"", ""Member"": ""TopTexturePixel"", ""Value"": 5.0 } ]
+        }");
+
+        var sprite = (Sprite)builder.Create(save)!;
+
+        sprite.SourceRectangle!.Value.Y.ShouldBe(5);
+        diagnostics.ShouldBeEmpty();
     }
 
     [Fact]
@@ -205,6 +357,46 @@ public class GlueObjectBuilderTests
         circle.X.ShouldBe(10f);
         circle.AbsoluteX.ShouldBe(110f);
         circle.AbsoluteY.ShouldBe(195f);
+    }
+
+    [Fact]
+    public void AddTo_LayerNamedObject_AddsToScreenLayers()
+    {
+        var diagnostics = new List<GlueLoadDiagnostic>();
+        var screen = new Screen();
+        var builder = new GlueObjectBuilder(diagnostics, owningScreen: screen);
+        var save = Save(@"{
+            ""InstanceName"": ""Foreground"",
+            ""SourceClassType"": ""FlatRedBall.Graphics.Layer""
+        }");
+
+        var layer = (Layer)builder.AddTo(screen, save)!;
+
+        screen.Layers.ShouldContain(layer);
+        layer.Name.ShouldBe("Foreground");
+    }
+
+    [Fact]
+    public void AddTo_ObjectWithLayerOn_PlacesItOnTheNamedLayer()
+    {
+        var diagnostics = new List<GlueLoadDiagnostic>();
+        var screen = new Screen();
+        var builder = new GlueObjectBuilder(diagnostics, owningScreen: screen);
+        var layerSave = Save(@"{
+            ""InstanceName"": ""Foreground"",
+            ""SourceClassType"": ""FlatRedBall.Graphics.Layer""
+        }");
+        var layer = (Layer)builder.AddTo(screen, layerSave)!;
+        layer.ShouldNotBeNull();
+        var spriteSave = Save(@"{
+            ""InstanceName"": ""Hero"",
+            ""SourceClassType"": ""FlatRedBall.Sprite"",
+            ""LayerOn"": ""Foreground""
+        }");
+
+        var sprite = (FlatRedBall2.Rendering.Sprite)builder.AddTo(screen, spriteSave)!;
+
+        sprite.Layer.ShouldBe(layer);
     }
 
     [Fact]

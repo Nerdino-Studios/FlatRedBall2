@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
+using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using FlatRedBall2.Glue.Model;
 
@@ -44,8 +45,16 @@ public sealed class GlueObjectBuilder
     /// <summary>
     /// Constructs and configures an instance without attaching or registering it.
     /// </summary>
+    /// <param name="save">The object to build.</param>
+    /// <param name="elementName">The owning screen or entity's Glue name, for diagnostics.</param>
+    /// <param name="listName">
+    /// The Glue list <paramref name="save"/> is a member of, if any — threaded through to
+    /// <see cref="GlueProject.CreateEntity(string, Screen, string?)"/> when this builds a nested
+    /// entity, so a design-time-placed list member is as visible to a relationship bound to that
+    /// list's name as one spawned into it at runtime.
+    /// </param>
     /// <returns>The configured instance, or null if this build cannot construct that type.</returns>
-    public object? Create(NamedObjectSave save, string? elementName = null)
+    public object? Create(NamedObjectSave save, string? elementName = null, string? listName = null)
     {
         var typeName = GlueTypeName.Parse(save.SourceClassType);
 
@@ -57,7 +66,7 @@ public sealed class GlueObjectBuilder
         // An object whose type names another element is a nested entity — built from that element's
         // own data rather than constructed from a CLR type.
         if (typeName.IsElementReference)
-            return CreateNestedEntity(save, elementName);
+            return CreateNestedEntity(save, elementName, listName);
 
         if (!GlueTypeMap.TryCreate(typeName, out object? instance))
         {
@@ -65,6 +74,11 @@ public sealed class GlueObjectBuilder
                  "this build. A later phase owns this type.", elementName);
             return null;
         }
+
+        // A Layer's identity is its Glue instance name, not an authored instruction — the
+        // parameterless factory in GlueTypeMap has no way to see it, so it is set here instead.
+        if (instance is Rendering.Layer layer)
+            layer.Name = save.InstanceName ?? layer.Name;
 
         ApplyShapeVisibilityDefault(instance);
         ApplyInstructions(instance, save, elementName);
@@ -89,11 +103,16 @@ public sealed class GlueObjectBuilder
     {
         object? instance = Create(save, elementName);
 
+        if (instance is null)
+            return null;
+
+        var layer = ResolveLayerOn(_owningScreen, save, elementName);
+
         // A Gum visual is not IAttachable — it is parented through the entity's own Gum support,
         // which is what keeps it following the entity.
         if (instance is Gum.Wireframe.GraphicalUiElement visual)
         {
-            container.Add(visual);
+            container.Add(visual, layer);
             return instance;
         }
 
@@ -108,13 +127,13 @@ public sealed class GlueObjectBuilder
         {
             switch (instance)
             {
-                case Collision.AARect rect: container.Add(rect, isDefaultCollision: false); return instance;
-                case Collision.Circle circle: container.Add(circle, isDefaultCollision: false); return instance;
-                case Collision.Polygon polygon: container.Add(polygon, isDefaultCollision: false); return instance;
+                case Collision.AARect rect: container.Add(rect, isDefaultCollision: false, layer); return instance;
+                case Collision.Circle circle: container.Add(circle, isDefaultCollision: false, layer); return instance;
+                case Collision.Polygon polygon: container.Add(polygon, isDefaultCollision: false, layer); return instance;
             }
         }
 
-        container.Add(attachable);
+        container.Add(attachable, layer);
         return instance;
     }
 
@@ -127,6 +146,7 @@ public sealed class GlueObjectBuilder
     public object? AddTo(Screen container, NamedObjectSave save, string? elementName = null)
     {
         object? instance = Create(save, elementName);
+        var layer = instance is null ? null : ResolveLayerOn(container, save, elementName);
 
         switch (instance)
         {
@@ -140,6 +160,9 @@ public sealed class GlueObjectBuilder
             case Entity entity:
                 container.Register(entity);
 
+                if (layer is not null)
+                    entity.Layer = layer;
+
                 // Register wires the entity up but does not initialise it — the engine's own
                 // Factory does that as a separate step. Skipping it leaves an engine entity in a
                 // half-built state: a camera controller resolves its Camera in CustomInitialize and
@@ -151,16 +174,50 @@ public sealed class GlueObjectBuilder
 
                 break;
 
+            // A Layer itself joins the screen's layer registry rather than its render list — it is
+            // the bucket other objects render into, not a renderable of its own.
+            case Rendering.Layer newLayer:
+                container.Layers.Add(newLayer);
+                break;
+
             case Gum.Wireframe.GraphicalUiElement visual:
-                container.Add(visual);
+                container.Add(visual, layer);
                 break;
 
             case Rendering.IRenderable renderable:
-                container.Add(renderable);
+                container.Add(renderable, layer);
                 break;
         }
 
         return instance;
+    }
+
+    /// <summary>
+    /// Resolves an object's authored <see cref="NamedObjectSave.LayerOn"/> to the built
+    /// <see cref="Rendering.Layer"/> it names, so the caller can pass it to the layer-aware
+    /// <c>Add</c> overload instead of falling through to the container's default layer.
+    /// </summary>
+    /// <remarks>
+    /// Looked up by name on <paramref name="screen"/>'s <see cref="Screen.Layers"/> rather than a
+    /// builder-local table, because that is the same registry
+    /// <see cref="AddTo(Screen, NamedObjectSave, string?)"/> adds a built <c>Layer</c> object to — so
+    /// this depends on the Layer having already been built, which matches Glue's own authoring
+    /// convention of declaring layers before the objects placed on them.
+    /// </remarks>
+    private Rendering.Layer? ResolveLayerOn(Screen? screen, NamedObjectSave save, string? elementName)
+    {
+        if (string.IsNullOrEmpty(save.LayerOn))
+            return null;
+
+        var layer = screen?.Layers.Find(l => l.Name == save.LayerOn);
+
+        if (layer is null)
+        {
+            Warn($"'{save.InstanceName}' names the layer '{save.LayerOn}', which was not found; " +
+                 "it was added to the default layer instead.", elementName);
+        }
+
+        return layer;
     }
 
     /// <summary>
@@ -200,6 +257,12 @@ public sealed class GlueObjectBuilder
             if (TryApplyAsAsset(instance, memberName, instruction, save, elementName))
                 continue;
 
+            if (IsShiftMapToMoveGameplayLayerToZ0NoOp(instance, memberName))
+                continue;
+
+            if (TryApplyAsSourceRectangleEdge(instance, memberName, instruction, save, elementName))
+                continue;
+
             var property = GlueMemberWriter.FindProperty(instance, memberName);
 
             if (property is null || !property.CanWrite)
@@ -231,7 +294,7 @@ public sealed class GlueObjectBuilder
     /// either, this reports and skips — which is what every build did before a project context
     /// existed.
     /// </remarks>
-    private object? CreateNestedEntity(NamedObjectSave save, string? elementName)
+    private object? CreateNestedEntity(NamedObjectSave save, string? elementName, string? listName)
     {
         if (_project is null || _owningScreen is null)
         {
@@ -256,7 +319,7 @@ public sealed class GlueObjectBuilder
             return null;
         }
 
-        var entity = _project.CreateEntity(referenced.Name!, _owningScreen);
+        var entity = _project.CreateEntity(referenced.Name!, _owningScreen, listName);
 
         // The instance's own instructions layer on top of the entity's authored values.
         ApplyInstructions(entity, save, elementName);
@@ -364,9 +427,64 @@ public sealed class GlueObjectBuilder
         return true;
     }
 
+    /// <summary>
+    /// FRB1's <c>ShiftMapToMoveGameplayLayerToZ0</c> generates code that shifts a map's Z so its
+    /// "GameplayLayer" sub-layer lands at Z = 0. FRB2's <see cref="Tiled.TileMap"/> does this
+    /// unconditionally on every load (see its <c>AssignDefaultZ</c>), and has no map-level Z to
+    /// shift in the first place — only per-layer Z exists. The flag's requested effect already
+    /// always holds, so recognize it on a map and consume it instead of warning about a missing
+    /// property.
+    /// </summary>
+    private static bool IsShiftMapToMoveGameplayLayerToZ0NoOp(object instance, string memberName) =>
+        memberName == "ShiftMapToMoveGameplayLayerToZ0" && instance is Tiled.TileMap;
+
     /// <summary>Whether a property holds a loaded asset rather than a plain value.</summary>
     private static bool IsAssetType(Type type) =>
         type == typeof(Texture2D) || type == typeof(Animation.AnimationChainList);
+
+    /// <summary>
+    /// Applies one edge of a Sprite's <see cref="Rendering.Sprite.SourceRectangle"/> from a Glue
+    /// pixel-edge instruction (<c>LeftTexturePixel</c>, <c>RightTexturePixel</c>,
+    /// <c>TopTexturePixel</c>, <c>BottomTexturePixel</c>).
+    /// </summary>
+    /// <remarks>
+    /// FRB2 has no per-edge properties, only one <c>Rectangle?</c>, and Glue authors these four as
+    /// separate instructions in no guaranteed order — a sprite might set only Left+Right, or all
+    /// four. Each edge is computed from the <em>opposite</em> edge of whatever rectangle already
+    /// exists (defaulting to zero) rather than from the edge it shares an axis with, so the final
+    /// rectangle comes out the same no matter which edge instruction runs first.
+    /// </remarks>
+    private bool TryApplyAsSourceRectangleEdge(
+        object instance, string memberName, InstructionSave instruction,
+        NamedObjectSave save, string? elementName)
+    {
+        if (instance is not Rendering.Sprite sprite)
+            return false;
+
+        if (memberName is not ("LeftTexturePixel" or "RightTexturePixel" or "TopTexturePixel" or "BottomTexturePixel"))
+            return false;
+
+        if (!GlueValueConverter.TryConvert(instruction.Value, typeof(float), out object? converted) ||
+            converted is not float pixels)
+        {
+            Warn($"'{save.InstanceName}.{memberName}' could not take the authored value " +
+                 $"'{instruction.Value}' as a pixel edge; the default was kept.", elementName);
+            return true;
+        }
+
+        int edge = (int)MathF.Round(pixels);
+        Rectangle current = sprite.SourceRectangle ?? new Rectangle(0, 0, 0, 0);
+
+        sprite.SourceRectangle = memberName switch
+        {
+            "LeftTexturePixel" => new Rectangle(edge, current.Y, current.Right - edge, current.Height),
+            "RightTexturePixel" => new Rectangle(current.X, current.Y, edge - current.X, current.Height),
+            "TopTexturePixel" => new Rectangle(current.X, edge, current.Width, current.Bottom - edge),
+            _ /* BottomTexturePixel */ => new Rectangle(current.X, current.Y, current.Width, edge - current.Y),
+        };
+
+        return true;
+    }
 
     private void Warn(string message, string? elementName) =>
         _diagnostics.Add(new GlueLoadDiagnostic(GlueDiagnosticSeverity.Warning, message, elementName));

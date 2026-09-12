@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using FlatRedBall2.Collision;
 using FlatRedBall2.Glue;
 using FlatRedBall2.Glue.Model;
 using Shouldly;
@@ -181,6 +183,35 @@ public class GlueCollisionTests
         settings.FirstCollisionName.ShouldBe(settings.SecondCollisionName);
     }
 
+    // The relationship binds "PlayerBallList" at build time. A ball a runtime Factory spawns
+    // afterwards must still be visible to it — not just the two balls placed in Glue.
+    [Fact]
+    public void BuildObjects_EntitySpawnedAfterRegistration_ParticipatesInCollision()
+    {
+        var engine = new FlatRedBallService();
+        var project = GlueProject.Load(Gluj("Beefball"));
+        engine.GlueProject = project;
+        engine.Start<GlueScreen>(s => { s.Save = project.StartUpScreen; s.Project = project; });
+
+        var screen = (GlueScreen)engine.CurrentScreen;
+        var relationship =
+            (CollisionRelationship<GlueEntity, GlueEntity>)screen.Objects["PlayerBallVsPuck"];
+
+        var puck = project.InstancesOf(@"Entities\Puck").Single();
+        puck.X = 0f;
+        puck.Y = 0f;
+
+        var spawnedBall = project.CreateEntity(@"Entities\PlayerBall", screen);
+        spawnedBall.X = 0f;
+        spawnedBall.Y = 0f;
+
+        GlueEntity? collidedBall = null;
+        relationship.CollisionOccurred += (ball, _) => collidedBall = ball;
+        relationship.RunCollisions();
+
+        collidedBall.ShouldBeSameAs(spawnedBall);
+    }
+
     [Fact]
     public void BuildObjects_RelationshipNamingAMissingObject_WarnsAndSkips()
     {
@@ -196,5 +227,36 @@ public class GlueCollisionTests
 
         screen.BuildDiagnostics.ShouldContain(d =>
             d.Severity == GlueDiagnosticSeverity.Warning && d.Message.Contains("GoneList"));
+    }
+
+    // ListA and ListB are both Entities\Blob, each with its own declared member (BlobInA/BlobInB).
+    // Binding by entity type (as opposed to the list's own name) would collapse them onto one shared
+    // live view, so ListA's relationship would wrongly see ListB's member too. ListB is also
+    // AssociateWithFactory=false, unlike ListA — a spawn with no explicit list must respect that and
+    // join only ListA.
+    [Fact]
+    public void BuildObjects_TwoListsOfSameEntityType_KeepSeparateCollisionMembership()
+    {
+        var engine = new FlatRedBallService();
+        var project = GlueProject.Load(Gluj("TwoLists"));
+        engine.GlueProject = project;
+        engine.Start<GlueScreen>(s => { s.Save = project.StartUpScreen; s.Project = project; });
+
+        var screen = (GlueScreen)engine.CurrentScreen;
+        var listAVsTarget =
+            (CollisionRelationship<GlueEntity, GlueEntity>)screen.Objects["ListAVsTarget"];
+        var blobInB = (GlueEntity)((List<object>)screen.Objects["ListB"]).Single();
+
+        // A spawn with no explicit list joins only lists opted into the factory (ListA), never ListB.
+        var spawned = project.CreateEntity(@"Entities\Blob", screen);
+        spawned.X = 0f;
+        spawned.Y = 0f;
+
+        var seenByListA = new List<GlueEntity>();
+        listAVsTarget.CollisionOccurred += (blob, _) => seenByListA.Add(blob);
+        listAVsTarget.RunCollisions();
+
+        seenByListA.ShouldNotContain(blobInB);
+        seenByListA.ShouldContain(spawned);
     }
 }

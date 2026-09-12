@@ -158,6 +158,18 @@ internal static class GlueCollisionBuilder
     /// <summary>
     /// Resolves one side to something collidable: an entity list, a single entity, or tile shapes.
     /// </summary>
+    /// <remarks>
+    /// A Glue list is built once, at load, into a plain snapshot (<see cref="GlueElementBuilder.Build"/>).
+    /// Binding a relationship straight to that snapshot means an entity spawned afterwards — via
+    /// <see cref="GlueProject.CreateEntity(string, Screen, string?)"/>, the Factory-equivalent path —
+    /// is invisible to it forever. <see cref="GlueProject.InstancesOfList"/> is the live list every
+    /// instance spawned into <paramref name="name"/> is tracked in (added on create, removed on
+    /// destroy), so this resolves to that instead of the snapshot.
+    /// <para>Keyed by the list's own instance name, not its element type — two differently-named
+    /// lists of the same entity type (e.g. two enemy waves) must stay distinct live views, not
+    /// collapse onto one shared list. An entity can still be live in both at once (G82): membership
+    /// is per list, not exclusive.</para>
+    /// </remarks>
     private static object? ResolveSide(
         string name, Dictionary<string, object> objects, GlueProject? project)
     {
@@ -168,7 +180,10 @@ internal static class GlueCollisionBuilder
         if (side is List<object> list)
         {
             var entities = list.OfType<GlueEntity>().ToList();
-            return entities.Count == list.Count ? entities : null;
+            if (entities.Count != list.Count)
+                return null;
+
+            return project is not null ? (object)project.InstancesOfList(name) : entities;
         }
 
         return side;

@@ -579,10 +579,16 @@ public partial class AnimationTreeControl : UserControl
             if (completingCut && pendingCut.Kind != CopySelectionKind.Shape) return;
             var frame = _selectedState!.SelectedFrame;
             if (frame is null) return;
+            // Cut/paste (same-document or cross-document) keeps a single-target destination
+            // (see #1099 follow-up); a plain paste applies to every selected frame, not just
+            // the last-clicked one.
+            IReadOnlyList<AnimationFrameSave> targetFrames = completingCut
+                ? new[] { frame }
+                : _selectedState.SelectedFrames;
 
             if (completingCutAcrossDocuments)
             {
-                _appCommands!.PasteShapes(frame, rectangles ?? new List<AARectSave>(), circles ?? new List<CircleSave>());
+                _appCommands!.PasteShapes(targetFrames, rectangles ?? new List<AARectSave>(), circles ?? new List<CircleSave>());
                 pendingCut.RemoveSourcesFrom(pendingCut.SourceDocument!);
             }
             else if (completingCut)
@@ -600,7 +606,7 @@ public partial class AnimationTreeControl : UserControl
             }
             else
             {
-                _appCommands!.PasteShapes(frame, rectangles ?? new List<AARectSave>(), circles ?? new List<CircleSave>());
+                _appCommands!.PasteShapes(targetFrames, rectangles ?? new List<AARectSave>(), circles ?? new List<CircleSave>());
             }
         }
 
@@ -643,20 +649,18 @@ public partial class AnimationTreeControl : UserControl
             }
             case AARectSave rectToDel:
             {
-                var frame = _selectedState!.SelectedFrame!;
-                var rects = _selectedState.SelectedRectangles;
+                var rects = _selectedState!.SelectedRectangles;
                 var circles = _selectedState.SelectedCircles;
                 _appCommands!.DeleteShapes(
-                    frame, rects.Count > 0 ? rects : new List<AARectSave> { rectToDel }, circles);
+                    rects.Count > 0 ? rects : new List<AARectSave> { rectToDel }, circles);
                 break;
             }
             case CircleSave circleToDel:
             {
-                var frame = _selectedState!.SelectedFrame!;
-                var circles = _selectedState.SelectedCircles;
+                var circles = _selectedState!.SelectedCircles;
                 var rects = _selectedState.SelectedRectangles;
                 _appCommands!.DeleteShapes(
-                    frame, rects, circles.Count > 0 ? circles : new List<CircleSave> { circleToDel });
+                    rects, circles.Count > 0 ? circles : new List<CircleSave> { circleToDel });
                 break;
             }
         }

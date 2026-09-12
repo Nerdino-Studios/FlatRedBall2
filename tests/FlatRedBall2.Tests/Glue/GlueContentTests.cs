@@ -1,10 +1,15 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using FlatRedBall2.Audio;
 using FlatRedBall2.Glue;
 using FlatRedBall2.Glue.Model;
+using FlatRedBall2.IO;
+using Microsoft.Xna.Framework.Audio;
 using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Media;
 using Shouldly;
 using Xunit;
 
@@ -40,6 +45,38 @@ public class GlueContentTests
     }
 
     [Fact]
+    public void CreatesCsvDictionary_CreationOptionsPropertyIsTheQuotedStringDictionary_ReturnsTrue()
+    {
+        // Glue writes this flag two ways depending on which UI authored the file. Real projects
+        // (e.g. KidDefense's LocalizationDatabase.csv) use this one, and the property's JSON value
+        // is a string that itself contains literal quote characters: "\"Dictionary\"".
+        string json = @"{
+            ""Name"": ""GlobalContent/Localization.csv"",
+            ""Properties"": [ { ""Name"": ""CreationOptions"", ""Value"": ""\""Dictionary\"""" } ]
+        }";
+
+        var file = JsonSerializer.Deserialize(json, GlueJsonContext.Default.ReferencedFileSave)!;
+
+        file.CreatesCsvDictionary.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void CreatesCsvDictionary_CreatesDictionaryIsTrue_ReturnsTrue()
+    {
+        var file = new ReferencedFileSave { Name = "GlobalContent/TechTreeUnlocks.csv", CreatesDictionary = true };
+
+        file.CreatesCsvDictionary.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void CreatesCsvDictionary_NeitherFlagSet_ReturnsFalse()
+    {
+        var file = new ReferencedFileSave { Name = "GlobalContent/Plain.csv" };
+
+        file.CreatesCsvDictionary.ShouldBeFalse();
+    }
+
+    [Fact]
     public void Deserialize_ReferencedFileOmittingLoadedAtRuntime_DefaultsToLoading()
     {
         // FRB1 defaults this true and Glue omits defaults, so `true` never appears on disk. Reading
@@ -64,6 +101,79 @@ public class GlueContentTests
         GlueContentSource.InstanceNameOf("Global/My File (2).png").ShouldBe("MyFile2");
         GlueContentSource.InstanceNameOf("Global/side-scroll.png").ShouldBe("side_scroll");
         GlueContentSource.InstanceNameOf("Global/2ndTexture.png").ShouldBe("_2ndTexture");
+    }
+
+    [Fact]
+    public void Load_ContentRootThatCannotBeOpened_WarnsRatherThanKillingTheLoad()
+    {
+        // An absolute root makes TitleContainer throw ArgumentException rather than an IO error.
+        // Letting it escape takes down the whole element load, which breaks the loader's central
+        // promise that a bad asset costs you that asset and nothing else.
+        if (!_graphics.IsAvailable)
+            return;
+
+        var source = new GlueContentSource(
+            _graphics.ContentLoader!,
+            Path.Combine(AppContext.BaseDirectory, "Glue", "Fixtures", "DoorsDemo", "Content"));
+
+        var entity = new GlueEntity
+        {
+            Save = LoadFixtureEntity("DoorsDemo", "Door.glej"),
+            Content = source,
+        };
+
+        Should.NotThrow(() => entity.BuildObjects());
+
+        entity.Objects.ShouldContainKey("SpriteInstance");
+        entity.BuildDiagnostics.ShouldContain(d => d.Severity == GlueDiagnosticSeverity.Warning);
+    }
+
+    [Fact]
+    public void Load_CsvReferencedFile_IsAddressableAsText()
+    {
+        // Phase 4 makes the file available; Phases 11 and 12 parse the rows.
+        var source = SourceFor("DoorsDemo");
+        if (source is null)
+            return;
+
+        var entity = new GlueEntity
+        {
+            Save = LoadFixtureEntity("DoorsDemo", "Player.glej"),
+            Content = source,
+        };
+
+        entity.BuildObjects();
+
+        string? csv = entity.Content!.GetText("PlatformerValuesStatic");
+
+        csv.ShouldNotBeNull();
+        csv.ShouldContain("MaxSpeedX");
+    }
+
+    [Fact]
+    public void Load_CsvReferencedFileWithCreatesDictionary_IsAddressableAsATypedRowDictionary()
+    {
+        // PlatformerValuesStatic.csv's ReferencedFileSave sets CreatesDictionary: true, so its rows
+        // should also be reachable as CsvRows keyed by the required "Name" column, each column
+        // converted per its header's declared type rather than left as text.
+        var source = SourceFor("DoorsDemo");
+        if (source is null)
+            return;
+
+        var entity = new GlueEntity
+        {
+            Save = LoadFixtureEntity("DoorsDemo", "Player.glej"),
+            Content = source,
+        };
+
+        entity.BuildObjects();
+
+        var rows = entity.Content!.Get<Dictionary<string, CsvRow>>("PlatformerValuesStatic");
+
+        rows.ShouldNotBeNull();
+        rows.ShouldContainKey("Ground");
+        rows["Ground"].Get<float>("MaxSpeedX").ShouldBe(100f);
+        rows["Ground"].Get<bool>("JumpApplyByButtonHold").ShouldBeTrue();
     }
 
     [Fact]
@@ -112,28 +222,44 @@ public class GlueContentTests
     }
 
     [Fact]
-    public void Load_ContentRootThatCannotBeOpened_WarnsRatherThanKillingTheLoad()
+    public void Load_OggReferencedFile_ReachesSongFromUriRatherThanTheSilentDefault()
     {
-        // An absolute root makes TitleContainer throw ArgumentException rather than an IO error.
-        // Letting it escape takes down the whole element load, which breaks the loader's central
-        // promise that a bad asset costs you that asset and nothing else.
+        // No vendored fixture decodes to real audio (constructing a valid Vorbis bitstream by hand
+        // isn't practical), so the fixture is a placeholder file that fails to decode. That still
+        // proves the .ogg branch is reached — Song.FromUri reads the container eagerly and throws a
+        // container/codec-specific ArgumentException, caught and reported same as any other asset,
+        // rather than the extension silently falling into the old default: case with no diagnostic
+        // at all.
+        var source = SourceFor("DoorsDemo");
+        if (source is null)
+            return;
+
+        var save = new EntitySave { Name = "Entities/Test" };
+        save.ReferencedFiles.Add(new ReferencedFileSave { Name = "GlobalContent/Audio/Music/Theme.ogg" });
+
+        var entity = new GlueEntity { Save = save, Content = source };
+        entity.BuildObjects();
+
+        entity.BuildDiagnostics.ShouldContain(d =>
+            d.Severity == GlueDiagnosticSeverity.Warning && d.Message.Contains("Theme.ogg"));
+    }
+
+    [Fact]
+    public void Load_ProjectGlobalFiles_LoadsEntriesOtherThanTheGumProjectToo()
+    {
+        // GlobalFiles is a project-level ReferencedFileSave list, same shape as an element's own
+        // ReferencedFiles. GlueGumResolver has always pulled the .gumx out of it; every other entry
+        // (DoorsDemo.gluj now also declares StandardTilesetIcons.png) needs the same loading an
+        // element's ReferencedFiles already gets.
         if (!_graphics.IsAvailable)
             return;
 
-        var source = new GlueContentSource(
-            _graphics.ContentLoader!,
-            Path.Combine(AppContext.BaseDirectory, "Glue", "Fixtures", "DoorsDemo", "Content"));
+        var project = FlatRedBall2.Glue.GlueProject.Load(
+            Path.Combine(AppContext.BaseDirectory, "Glue", "Fixtures", "DoorsDemo", "DoorsDemo.gluj"),
+            new GlueContentSource(
+                _graphics.ContentLoader!, FixtureDirectory("DoorsDemo"), _graphics.GraphicsDevice));
 
-        var entity = new GlueEntity
-        {
-            Save = LoadFixtureEntity("DoorsDemo", "Door.glej"),
-            Content = source,
-        };
-
-        Should.NotThrow(() => entity.BuildObjects());
-
-        entity.Objects.ShouldContainKey("SpriteInstance");
-        entity.BuildDiagnostics.ShouldContain(d => d.Severity == GlueDiagnosticSeverity.Warning);
+        project.Content!.Get<Texture2D>("StandardTilesetIcons").ShouldNotBeNull();
     }
 
     [Fact]
@@ -152,28 +278,6 @@ public class GlueContentTests
         var sprite = (FlatRedBall2.Rendering.Sprite)entity.Objects["SpriteInstance"];
 
         sprite.AnimationChains.ShouldBeNull();
-    }
-
-    [Fact]
-    public void Load_CsvReferencedFile_IsAddressableAsText()
-    {
-        // Phase 4 makes the file available; Phases 11 and 12 parse the rows.
-        var source = SourceFor("DoorsDemo");
-        if (source is null)
-            return;
-
-        var entity = new GlueEntity
-        {
-            Save = LoadFixtureEntity("DoorsDemo", "Player.glej"),
-            Content = source,
-        };
-
-        entity.BuildObjects();
-
-        string? csv = entity.Content!.GetText("PlatformerValuesStatic");
-
-        csv.ShouldNotBeNull();
-        csv.ShouldContain("MaxSpeedX");
     }
 
     [Fact]
@@ -202,5 +306,44 @@ public class GlueContentTests
 
         sprite.Texture.ShouldNotBeNull();
         sprite.Texture.ShouldBeOfType<Texture2D>();
+    }
+
+    [Fact]
+    public void Load_WavReferencedFile_ResolvesAsAPlayableSoundEffect()
+    {
+        var source = SourceFor("DoorsDemo");
+        if (source is null)
+            return;
+
+        var save = new EntitySave { Name = "Entities/Test" };
+        save.ReferencedFiles.Add(new ReferencedFileSave { Name = "GlobalContent/Audio/Sfx/hit.wav" });
+
+        var entity = new GlueEntity { Save = save, Content = source };
+        entity.BuildObjects();
+
+        var soundEffect = source.Get<SoundEffect>("hit");
+        soundEffect.ShouldNotBeNull();
+        Should.NotThrow(() => new AudioManager().Play(soundEffect));
+    }
+
+    [Fact]
+    public void Load_WildcardGlobalFilesEntry_ExpandsAndLoadsEachMatch()
+    {
+        // Mirrors the real GlobalFiles entry from #1085: "GlobalContent/Audio/Sfx/**/*.wav" written
+        // literally as the Name, with two .wav files at different depths under Sfx/.
+        var source = SourceFor("DoorsDemo");
+        if (source is null)
+            return;
+
+        var save = new EntitySave { Name = "Entities/Test" };
+        save.ReferencedFiles.Add(
+            new ReferencedFileSave { Name = "GlobalContent/Audio/Sfx/**/*.wav" });
+
+        var entity = new GlueEntity { Save = save, Content = source };
+        entity.BuildObjects();
+
+        source.Get<SoundEffect>("hit").ShouldNotBeNull();
+        source.Get<SoundEffect>("boom").ShouldNotBeNull();
+        entity.BuildDiagnostics.ShouldNotContain(d => d.Severity == GlueDiagnosticSeverity.Warning);
     }
 }

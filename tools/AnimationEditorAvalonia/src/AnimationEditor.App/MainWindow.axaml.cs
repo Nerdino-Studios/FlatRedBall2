@@ -1275,14 +1275,14 @@ public partial class MainWindow : Window
 
         WireframeCtrl.LoadTexture(absolutePath);
 
-        var frame = _selectedState.SelectedFrame;
-        if (frame == null) return;
+        var frames = _selectedState.SelectedFrames;
+        if (frames.Count == 0) return;
 
         string achxFolder = string.IsNullOrEmpty(_projectManager.FileName)
             ? string.Empty
             : (Path.GetDirectoryName(_projectManager.FileName) ?? string.Empty);
         string storePath = TexturePathHelper.ComputeStorePath(absolutePath, achxFolder);
-        _appCommands.SetFrameTextureName(frame, storePath);
+        _appCommands.SetFrameTextureName(frames, storePath);
         RefreshPropertyPanel();
     }
 
@@ -4917,9 +4917,6 @@ public partial class MainWindow : Window
 
     private async Task BrowseForFrameTexture()
     {
-        var frame = _selectedState.SelectedFrame;
-        if (frame is null) return;
-
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
             Title = "Select Texture",
@@ -4933,6 +4930,19 @@ public partial class MainWindow : Window
 
         var pickedPath = files?.FirstOrDefault()?.TryGetLocalPath();
         if (string.IsNullOrEmpty(pickedPath)) return;
+
+        await ApplyPickedTextureAsync(pickedPath);
+    }
+
+    /// <summary>
+    /// Dialog-free core of <see cref="BrowseForFrameTexture"/>: applies <paramref name="pickedPath"/>
+    /// as the texture for every currently selected frame. Split out so tests can drive it directly
+    /// without going through the real OS file picker.
+    /// </summary>
+    internal async Task ApplyPickedTextureAsync(string pickedPath)
+    {
+        var frames = _selectedState.SelectedFrames;
+        if (frames.Count == 0) return;
 
         string achxFolder = string.IsNullOrEmpty(_projectManager.FileName)
             ? string.Empty
@@ -4963,7 +4973,7 @@ public partial class MainWindow : Window
                         try
                         {
                             File.Copy(capturedSource, capturedDest, overwrite: true);
-                            CommitFrameTexture(new[] { frame }, TexturePathHelper.ComputeStorePath(capturedDest, achxFolder), capturedDest);
+                            CommitFrameTexture(frames, TexturePathHelper.ComputeStorePath(capturedDest, achxFolder), capturedDest);
                         }
                         catch (Exception retryEx)
                         {
@@ -4980,7 +4990,7 @@ public partial class MainWindow : Window
             ? resolvedAbsPath
             : TexturePathHelper.ComputeStorePath(resolvedAbsPath, achxFolder);
 
-        CommitFrameTexture(new[] { frame }, storePath, resolvedAbsPath);
+        CommitFrameTexture(frames, storePath, resolvedAbsPath);
     }
 
     private enum TextureCopyChoice { Copy, Keep, Cancel }
@@ -6404,10 +6414,16 @@ public partial class MainWindow : Window
             if (completingCut && _pendingCutState.Kind != CopySelectionKind.Shape) return;
             var frame = _selectedState.SelectedFrame;
             if (frame is null) return;
+            // Cut/paste (same-document or cross-document) keeps a single-target destination
+            // (see #1099 follow-up); a plain paste applies to every selected frame, not just
+            // the last-clicked one.
+            IReadOnlyList<AnimationFrameSave> targetFrames = completingCut
+                ? new[] { frame }
+                : _selectedState.SelectedFrames;
 
             if (completingCutAcrossDocuments)
             {
-                _appCommands.PasteShapes(frame, rectangles ?? [], circles ?? []);
+                _appCommands.PasteShapes(targetFrames, rectangles ?? [], circles ?? []);
                 _pendingCutState.RemoveSourcesFrom(_pendingCutState.SourceDocument!);
             }
             else if (completingCut)
@@ -6424,9 +6440,10 @@ public partial class MainWindow : Window
             }
             else
             {
-                _appCommands.PasteShapes(frame, rectangles ?? [], circles ?? []);
+                _appCommands.PasteShapes(targetFrames, rectangles ?? [], circles ?? []);
             }
-            RefreshFrameNode(frame);
+            foreach (var targetFrame in targetFrames)
+                RefreshFrameNode(targetFrame);
             SyncTreeSelection();
         }
 
@@ -6577,18 +6594,16 @@ public partial class MainWindow : Window
             }
             case AARectSave rectToDel:
             {
-                var frame   = _selectedState.SelectedFrame!;
                 var rects   = _selectedState.SelectedRectangles;
                 var circles = _selectedState.SelectedCircles;
-                _appCommands.DeleteShapes(frame, rects.Count > 0 ? rects : new() { rectToDel }, circles);
+                _appCommands.DeleteShapes(rects.Count > 0 ? rects : new() { rectToDel }, circles);
                 break;
             }
             case CircleSave circleToDel:
             {
-                var frame   = _selectedState.SelectedFrame!;
                 var circles = _selectedState.SelectedCircles;
                 var rects   = _selectedState.SelectedRectangles;
-                _appCommands.DeleteShapes(frame, rects, circles.Count > 0 ? circles : new() { circleToDel });
+                _appCommands.DeleteShapes(rects, circles.Count > 0 ? circles : new() { circleToDel });
                 break;
             }
         }
