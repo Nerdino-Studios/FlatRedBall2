@@ -47,6 +47,8 @@ internal static class CollisionDispatcher
         // correct even when the caller is fully surrounded (net separation == zero).
         if (a is TileShapes tsca) return tsca.CollidesWith(b);
         if (b is TileShapes tscb) return tscb.CollidesWith(a);
+        if (a is HexShapes hsa) return hsa.CollidesWith(b);
+        if (b is HexShapes hsb) return hsb.CollidesWith(a);
         return GetSeparationVector(a, b) != Vector2.Zero || PointsOverlap(a, b);
     }
 
@@ -61,6 +63,9 @@ internal static class CollisionDispatcher
     // circle-arc geometry is used; the object is never treated as a bounding box.
     public static Vector2 GetSeparationVector(ICollidable a, ICollidable b)
     {
+        if (a is HexShapes hexA) return -hexA.GetSeparationFor(b);
+        if (b is HexShapes hexB) return hexB.GetSeparationFor(a);
+
         var mtv = (a, b) switch
         {
             (AARect ra, AARect rb) => AabbVsAabb(ra, rb),
