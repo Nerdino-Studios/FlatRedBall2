@@ -151,8 +151,8 @@ Use xUnit theories for orientation/shape variants, Shouldly assertions, alphabet
 
 ### E — Documentation and review (docs-writer, then qa)
 - [ ] Document radius, center origin, Y-up axes, negative cells, tie semantics, immutable layout, supported collision pairs, and discrete/multi-contact limitations in public XML docs.
-- [ ] Add `docs/hex-grid.md` with a minimal compile-checked screen example: construct layout, add occupied cells, register debug rendering, create actor through Factory, register move-first relationship, convert cursor world position to a cell, remove a cell. Clearly separate occupancy from visual/game terrain data. Do not alter the Animation Editor-focused `docs/SUMMARY.md` without checking its intended scope.
-- [ ] Read `.claude/agents/docs-writer.md` and `.claude/skills/skills-writer/SKILL.md` before skill work. Propose a short hex signpost in `frb-skills/tile-grid/SKILL.md`, correct the accuracy notes above, and obtain required skill-edit approval. Do not create a long new skill or copy this plan into skills.
+- [x] User documentation decision: keep usage guidance in the public `hex-grid` skill rather than adding `docs/hex-grid.md`; broader FRB2 documentation does not currently call for a standalone page.
+- [x] Read `.claude/skills/skills-writer/SKILL.md`, add the concise `frb-skills/hex-grid/SKILL.md`, and route axial layouts away from square-grid arithmetic in `frb-skills/tile-grid/SKILL.md`.
 - [ ] QA review: dispatch recursion/sign, multi-contact response, negative-cell candidate bounds, compound shapes, no query-time mutation, lifecycle, and existing square collision regressions.
 
 ## Validation and completion
