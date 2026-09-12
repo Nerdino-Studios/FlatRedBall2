@@ -622,6 +622,12 @@ public class CollisionRelationship<A, B> : ICollisionRelationship
         var sep = ComputeSeparationVector(effectiveA, effectiveB, out var axisAligned);
         if (sep == Vector2.Zero)
         {
+            if (IsHexContact(effectiveA, effectiveB)
+                && CollisionDispatcher.CollidesWith(effectiveA, effectiveB))
+            {
+                RecordContact(a, b);
+                CollisionOccurred?.Invoke(a, b);
+            }
             TryOfferGroundSnap(a, b);
             return;
         }
@@ -640,6 +646,9 @@ public class CollisionRelationship<A, B> : ICollisionRelationship
         CollisionOccurred?.Invoke(a, b);
         TryOfferGroundSnap(a, b);
     }
+
+    private static bool IsHexContact(ICollidable a, ICollidable b) =>
+        a is HexShapes || b is HexShapes;
 
     // Both lists are already sorted by their respective factories. radiusA/radiusB are each
     // factory's shared IFactory.PartitionMaxRadius — a single bound per side, not each entity's
@@ -681,6 +690,12 @@ public class CollisionRelationship<A, B> : ICollisionRelationship
                 var sep = ComputeSeparationVector(effectiveA, effectiveB, out var axisAligned);
                 if (sep == Vector2.Zero)
                 {
+                    if (IsHexContact(effectiveA, effectiveB)
+                        && CollisionDispatcher.CollidesWith(effectiveA, effectiveB))
+                    {
+                        RecordContact(a, b);
+                        CollisionOccurred?.Invoke(a, b);
+                    }
                     TryOfferGroundSnap(a, b);
                     continue;
                 }
