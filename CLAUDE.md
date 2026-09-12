@@ -63,6 +63,7 @@ Invoke these with the Skill tool when working on specific topics:
 - `physics-and-movement` — Y+ up, gravity, Drag, GameRandom
 - `timing` — Cooldown gates, repeating timers, entity lifetimes, FrameTime.DeltaSeconds
 - `shapes` — AARect, Circle, Polygon, visual properties
+- `hex-grid` — Axial coordinates, pointy/flat layouts, sparse HexShapes collision
 - `input-system` — Keyboard, gamepad, input binding
 - `camera` — Camera setup and transforms
 - `screens` — Screen lifecycle and transitions
