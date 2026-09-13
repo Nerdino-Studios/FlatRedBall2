@@ -11,7 +11,23 @@
         consumers size the root exactly like they already do for NumericUpDown/the raw TextBox
         versions this replaces.
     -->
-    <Border BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" CornerRadius="4"
+    <!-- #1114 follow-up: disabled state dims via a single Opacity on the whole control, set in
+         code-behind (OnPropertyChanged reacting to IsEnabledProperty) rather than a
+         "Selector=\"UserControl:disabled\"" style. Avalonia type selectors match the exact type,
+         not subclasses, so that selector never matches this UserControl subclass even though the
+         :disabled pseudo-class itself is set correctly. Not a background-color swap either:
+         Fluent's TextControlBackgroundDisabled renders LIGHTER than TextControlBackground in this
+         app's Dark theme, the opposite of "muted", so the background stays one constant color in
+         both states. The Button.flanker:disabled override below cancels ThemeStyles.axaml's global
+         Button:disabled Opacity so the flanker buttons don't double-dim under this control's fade
+         (Button selectors DO match here since MinusBtn/PlusBtn are literal Button instances). -->
+    <UserControl.Styles>
+        <Style Selector="Button.flanker:disabled">
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+    </UserControl.Styles>
+    <Border x:Name="RootBorder" Background="{DynamicResource TextControlBackground}"
+            BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" CornerRadius="4"
             ClipToBounds="True" Height="26">
         <DockPanel>
             <Button x:Name="MinusBtn" DockPanel.Dock="Left"
