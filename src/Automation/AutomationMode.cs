@@ -34,6 +34,11 @@ internal class AutomationMode
     // Game-thread only — no synchronization needed.
     private int _pendingStepCount;
     private bool _stepConsumedThisFrame;
+    // The keyboard handed to Gum Forms so injected keys/text reach the focused control. Created
+    // eagerly with the session (not on first use) so ordering never matters: the install into
+    // Gum is re-asserted every frame by EnsureGumKeyboardInstalled.
+    private readonly AutomationGumKeyboard _gumKeyboard;
+
     // Armed by "record_next_screenshot", consumed by the first Draw() that follows. Screenshots
     // can't be captured inline like query/set — the back buffer for the frame the caller cares
     // about isn't rendered until Draw() runs, which happens after ProcessCommand returns.
@@ -42,6 +47,7 @@ internal class AutomationMode
     internal AutomationMode(FlatRedBallService engine, System.IO.TextWriter? output = null, Action<string>? log = null)
     {
         _engine = engine;
+        _gumKeyboard = new AutomationGumKeyboard(engine.Input.Keyboard);
         _output = output ?? Console.Out;
         // stderr, not Debug.WriteLine: this log exists to explain a session that is producing no
         // responses, and a debugger listener is invisible to whoever is driving the pipe. stdout is
@@ -166,6 +172,29 @@ internal class AutomationMode
             _stepConsumedThisFrame = false;
             WriteResponse(new { ok = true, frame });
         }
+    }
+
+    /// <summary>
+    /// The keyboard this session feeds to Gum Forms. Exposed for tests; production code reaches
+    /// it through <see cref="EnsureGumKeyboardInstalled"/>.
+    /// </summary>
+    internal AutomationGumKeyboard GumKeyboard => _gumKeyboard;
+
+    /// <summary>
+    /// Installs this session's keyboard into Gum Forms if it is not already the active one.
+    /// Called every frame before Gum's update.
+    /// </summary>
+    /// <remarks>
+    /// Re-asserted per frame rather than once at startup because Gum owns the field: both
+    /// <c>FormsUtilities.InitializeDefaults</c> and <c>Uninitialize</c> overwrite it, and whether
+    /// either runs before or after automation starts depends on the order the game calls
+    /// <c>Initialize</c> and <c>EnableAutomationMode</c>. A reference comparison per frame costs
+    /// nothing and removes that ordering dependency entirely.
+    /// </remarks>
+    internal void EnsureGumKeyboardInstalled()
+    {
+        if (!ReferenceEquals(Gum.Forms.FormsUtilities.Keyboard, _gumKeyboard))
+            Gum.Forms.FormsUtilities.SetKeyboard(_gumKeyboard);
     }
 
     internal void RegisterStateProvider(string name, Func<object> provider)
@@ -321,6 +350,31 @@ internal class AutomationMode
                     break;
                 }
                 _engine.Input.InjectCursor(sx, sy, primary, secondary);
+                break;
+            }
+            case "text":
+            {
+                if (!cmd.TryGetProperty("text", out var textProp) || textProp.ValueKind != JsonValueKind.String)
+                {
+                    WriteResponse(new { ok = false, frame, error = "text input command requires a string 'text'" });
+                    break;
+                }
+
+                var text = textProp.GetString()!;
+                // Gum's keyboard silently drops control characters from the window buffer. Reject
+                // them instead: a client sending "\n" for Enter would otherwise see a text box
+                // that simply never changes, with nothing on the wire to explain why. Enter, Tab
+                // and Backspace go through input type:key.
+                for (var i = 0; i < text.Length; i++)
+                {
+                    if (!char.IsControl(text[i]))
+                        continue;
+                    var codePoint = $"U+{(int)text[i]:X4}";
+                    WriteResponse(new { ok = false, frame, error = $"text contains control character {codePoint} at index {i}; use input type:key for Enter/Tab/Backspace" });
+                    return;
+                }
+
+                _gumKeyboard.QueueText(text);
                 break;
             }
             default:

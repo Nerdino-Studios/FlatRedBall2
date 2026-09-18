@@ -1,6 +1,6 @@
 ---
 name: automation-mode
-description: Automation mode in FlatRedBall2. Use when an external agent (AI or script) needs to drive a running game: stepping frames, injecting input, querying entity state, or forcing entity values over stdin/stdout. Covers EnableAutomationMode, the NDJSON command protocol, reflection-based entity introspection, and optional RegisterStateProvider for derived state.
+description: "Automation mode in FlatRedBall2. Use when an external agent (AI or script) needs to drive a running game: stepping frames, injecting input, querying entity state, or forcing entity values over stdin/stdout. Covers EnableAutomationMode, the NDJSON command protocol, reflection-based entity introspection, and optional RegisterStateProvider for derived state."
 ---
 
 # Automation Mode in FlatRedBall2
@@ -52,6 +52,9 @@ Each command is a JSON object terminated by `\n`. Each response is a JSON object
 | Key down/up | `{"cmd":"input","type":"key","key":"Space","down":true}` |
 | Gamepad button | `{"cmd":"input","type":"gamepad","player":0,"button":"A","down":true}` |
 | Gamepad axis | `{"cmd":"input","type":"axis","player":0,"axis":"LeftStickX","value":0.8}` |
+| Cursor (screen px) | `{"cmd":"input","type":"cursor","x":120,"y":80,"primary":true}` |
+| Cursor (world coords) | `{"cmd":"input","type":"cursor","x":0,"y":0,"space":"world","primary":true}` |
+| Type text | `{"cmd":"input","type":"text","text":"MATCH-7F2A"}` |
 | Query active screen | `{"cmd":"query","target":"screen"}` |
 | Query all entities | `{"cmd":"query","target":"entities"}` |
 | Query one entity type | `{"cmd":"query","target":"Player"}` |
@@ -74,6 +77,10 @@ Synthetic state replaces MonoGame hardware polling. The injected state persists 
 Key names resolve via `Enum.Parse<Keys>()` — use MonoGame's `Keys` enum names verbatim (`Space`, `W`, `Left`, `LeftShift`). Same for gamepad buttons (`Buttons` enum) and axes (`GamepadAxis` enum: `LeftStickX`, `LeftStickY`, `RightStickX`, `RightStickY`, `LeftTrigger`, `RightTrigger`).
 
 Input commands produce no response — query if you need confirmation. `WasKeyPressed` style inputs require the down state to span at least one stepped frame between the down and up commands; combine `input down:true` → `step` → `input down:false` to register a press.
+
+Cursor injection takes screen pixels by default (origin top-left, Y+ down) or world coordinates with `"space":"world"`. World-space injection back-projects through the primary camera; use screen coordinates when camera choice must be explicit. Button states are sticky until the next cursor command. After cursor injection starts, real mouse and touch input are ignored for the rest of the session.
+
+Text goes to the focused Gum control — click it with a `cursor` command first or nothing receives it. `text` rejects control characters with an error rather than dropping them, so Enter/Tab/Backspace go through `input type:key`. Injected keys never repeat: one down/up pair is one keystroke however many frames it spans.
 
 ## Querying Entities (Zero Config)
 
@@ -106,7 +113,9 @@ Providers and setters live on the screen that registered them and disappear on s
 
 ## Capturing Screenshots
 
-`record_next_screenshot path:"out.png"` doesn't capture anything by itself — it arms a pending request. The back buffer for the frame you want isn't rendered until `Draw()` runs, which happens after the command is processed, so capture is deferred to the end of the *next* `Draw()` call. **You must follow it with a `step`** — that step is what actually triggers the `Draw()` that fulfills the request and writes the response (with the captured `frame` echoed back). Arming without a subsequent `step` leaves the request pending indefinitely.
+`record_next_screenshot path:"out.png"` doesn't capture anything by itself — it arms a pending request. The back buffer for the frame you want isn't rendered until `Draw()` runs, so capture is deferred to the end of the *next* `Draw()` call. **Follow it with a `step`** to trigger that draw and write the PNG response. An armed capture prevents draw suppression and delays `quit` until capture completes.
+
+Run automation under a bounded timeout, chain build and launch with `&&`, and assert the requested artifact exists. Responses use stdout; keep diagnostics on stderr or `Debug.WriteLine` so NDJSON remains parseable.
 
 ## Gotchas
 
