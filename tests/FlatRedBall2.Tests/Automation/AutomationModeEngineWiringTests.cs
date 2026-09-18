@@ -49,6 +49,112 @@ public class AutomationModeEngineWiringTests
         }
     }
 
+    /// <summary>
+    /// The whole point of the feature: an automation client types into a focused Gum TextBox and
+    /// the control's own Text updates, with no reflection, no value setter and no synthetic click.
+    /// </summary>
+    /// <remarks>
+    /// Needs a real device because a TextBox cannot be constructed without the Forms visual
+    /// templates, and those are built by Gum's bootstrap from an embedded texture. The headless
+    /// tests in AutomationTextInputTests.cs cover everything on this side of the seam; this covers
+    /// the seam itself.
+    /// </remarks>
+    [Theory]
+    [InlineData(true,  "MATCH-7F2A", "MATCH-7F2A")] // focused: text lands
+    [InlineData(false, "MATCH-7F2A", "")]           // unfocused: nothing lands
+    public void TextCommand_ThroughRealGameTicks_ReachesFocusedTextBoxOnly(
+        bool focused, string injected, string expected)
+    {
+        if (GumIsOwnedElsewhere)
+            return;
+
+        using var game = TryCreateGame();
+        if (game is null)
+            return;
+
+        var engine = new FlatRedBallService();
+        engine.Initialize(game);
+        engine.Start<Screen>();
+        game.Engine = engine;
+
+        try
+        {
+            var textBox = new Gum.Forms.Controls.TextBox();
+            engine.CurrentScreen.AddOverlay(textBox);
+            textBox.IsFocused = focused;
+
+            var commands =
+                $"{{\"cmd\":\"input\",\"type\":\"text\",\"text\":{JsonSerializer.Serialize(injected)}}}\n" +
+                "{\"cmd\":\"step\",\"count\":10}\n";
+            engine.StartAutomationMode(seed: 0, input: new StringReader(commands), output: new StringWriter());
+
+            for (int i = 0; i < 100 && (textBox.Text ?? "") != expected; i++)
+            {
+                game.RunOneFrame();
+                System.Threading.Thread.Sleep(5);
+            }
+
+            (textBox.Text ?? "").ShouldBe(expected);
+        }
+        finally
+        {
+            engine.Shutdown();
+        }
+    }
+
+    /// <summary>
+    /// Backspace is the editing behavior realistic entry needs, and it travels as a key rather
+    /// than as text. A disabled control must take neither.
+    /// </summary>
+    [Fact]
+    public void BackspaceKeyAndDisabledControl_ThroughRealGameTicks_EditAndRejectAsExpected()
+    {
+        if (GumIsOwnedElsewhere)
+            return;
+
+        using var game = TryCreateGame();
+        if (game is null)
+            return;
+
+        var engine = new FlatRedBallService();
+        engine.Initialize(game);
+        engine.Start<Screen>();
+        game.Engine = engine;
+
+        try
+        {
+            var typed = new Gum.Forms.Controls.TextBox();
+            engine.CurrentScreen.AddOverlay(typed);
+            typed.IsFocused = true;
+
+            var commands =
+                "{\"cmd\":\"input\",\"type\":\"text\",\"text\":\"abc\"}\n" +
+                "{\"cmd\":\"step\"}\n" +
+                "{\"cmd\":\"input\",\"type\":\"key\",\"key\":\"Back\",\"down\":true}\n" +
+                "{\"cmd\":\"step\"}\n" +
+                "{\"cmd\":\"input\",\"type\":\"key\",\"key\":\"Back\",\"down\":false}\n" +
+                "{\"cmd\":\"step\",\"count\":10}\n";
+            engine.StartAutomationMode(seed: 0, input: new StringReader(commands), output: new StringWriter());
+
+            for (int i = 0; i < 100 && (typed.Text ?? "") != "ab"; i++)
+            {
+                game.RunOneFrame();
+                System.Threading.Thread.Sleep(5);
+            }
+
+            // One down/up pair deleted exactly one character -- no key repeat.
+            (typed.Text ?? "").ShouldBe("ab");
+
+            // Disabling clears focus in Gum, so the disabled box takes nothing thereafter.
+            typed.IsEnabled = false;
+            typed.IsFocused.ShouldBeFalse();
+        }
+        finally
+        {
+            engine.Shutdown();
+        }
+    }
+
     [Fact]
     public void StepCountThenScreenshot_ThroughRealGameTicks_FlushesFromDrawAndCapturesWithoutAStep()
     {
