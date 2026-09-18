@@ -1,0 +1,44 @@
+<Project>
+  <!--
+    Gum, its Shapes runtime, and the KernSmith font adapters are consumed as ProjectReferences
+    into a sibling clone rather than as NuGet packages, so a Gum edit shows up in the very next
+    FRB2 build. The alternative (packing to a local folder feed) needs a version bump on every
+    edit, and NuGet caches by exact version — reusing one silently restores the stale package.
+
+    The clone is github.com/Nerdino-Studios/Gum, a fork of vchelaru/Gum. It must sit next to
+    this repo; override GumSourcePath if it lives elsewhere:
+
+        git clone https://github.com/Nerdino-Studios/Gum.git ../Gum
+        dotnet build src/FlatRedBall2.csproj -p:GumSourcePath=/some/other/Gum
+
+    All three KernSmith.*Gum adapters ship out of the Gum repo itself (Integrations/KernSmith),
+    so they come along with the same clone. The core KernSmith engine and its rasterizers are a
+    separate third-party repo (github.com/kaltinril/Kernsmith) that we do not fork or modify,
+    so those stay PackageReferences.
+
+    Gum targets net8.0 while the engine targets net10.0. That direction is fine — net8.0 is
+    compatible with a net10.0 consumer — and a ProjectReference is authoritative in NuGet's
+    graph, so it satisfies a transitive dependency on Gum.MonoGame regardless of the version in
+    Gum's own csproj (no NU1605).
+  -->
+  <PropertyGroup>
+    <GumSourcePath Condition="'$(GumSourcePath)' == ''">$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../Gum'))</GumSourcePath>
+  </PropertyGroup>
+
+  <Target Name="VerifyGumSourcePresent" BeforeTargets="CollectPackageReferences;Restore;BeforeBuild">
+    <Error Condition="!Exists('$(GumSourcePath)/MonoGameGum/MonoGameGum.csproj')"
+           Text="Gum source not found at '$(GumSourcePath)'. Clone github.com/Nerdino-Studios/Gum next to this repo (git clone https://github.com/Nerdino-Studios/Gum.git '$(GumSourcePath)'), or pass -p:GumSourcePath=&lt;path&gt;. See Gum.Source.props." />
+  </Target>
+
+  <ItemGroup Condition="'$(FrbGumBackend)' == 'MonoGame'">
+    <ProjectReference Include="$(GumSourcePath)/MonoGameGum/MonoGameGum.csproj" />
+    <ProjectReference Include="$(GumSourcePath)/Runtimes/GumShapes/MonoGameGumShapes.csproj" />
+    <ProjectReference Include="$(GumSourcePath)/Integrations/KernSmith/KernSmith.MonoGameGum/KernSmith.MonoGameGum.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(FrbGumBackend)' == 'Kni'">
+    <ProjectReference Include="$(GumSourcePath)/MonoGameGum/KniGum/KniGum.csproj" />
+    <ProjectReference Include="$(GumSourcePath)/Runtimes/GumShapes/KniGumShapes.csproj" />
+    <ProjectReference Include="$(GumSourcePath)/Integrations/KernSmith/KernSmith.KniGum/KernSmith.KniGum.csproj" />
+  </ItemGroup>
+</Project>

@@ -72,9 +72,6 @@
 
   <ItemGroup>
     <PackageReference Include="Apos.Shapes" />
-    <PackageReference Include="Gum.MonoGame" />
-    <PackageReference Include="Gum.Shapes.MonoGame" />
-    <PackageReference Include="KernSmith.MonoGameGum" />
     <PackageReference Include="MonoGame.Framework.DesktopGL">
       <PrivateAssets>All</PrivateAssets>
     </PackageReference>
@@ -96,4 +93,9 @@
   <ItemGroup>
     <EmbeddedResource Include="Rendering/Shaders/AddColor.mgfx" LogicalName="FlatRedBall2.Rendering.Shaders.AddColor.mgfx" />
   </ItemGroup>
+  <!-- Gum/KernSmith come from the sibling Gum clone as ProjectReferences; see Gum.Source.props. -->
+  <PropertyGroup>
+    <FrbGumBackend>MonoGame</FrbGumBackend>
+  </PropertyGroup>
+  <Import Project="../Gum.Source.props" />
 </Project>

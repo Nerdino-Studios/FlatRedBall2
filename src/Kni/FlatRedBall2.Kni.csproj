@@ -84,9 +84,6 @@
 
   <ItemGroup>
     <PackageReference Include="Apos.Shapes.KNI" />
-    <PackageReference Include="Gum.KNI" />
-    <PackageReference Include="Gum.Shapes.KNI" />
-    <PackageReference Include="KernSmith.KniGum" />
     <PackageReference Include="KNI.Extended" />
     <PackageReference Include="nkast.Xna.Framework" />
     <PackageReference Include="nkast.Xna.Framework.Content" />
@@ -112,4 +109,9 @@
   <ItemGroup>
     <EmbeddedResource Include="..\Rendering\Shaders\AddColor.mgfx" LogicalName="FlatRedBall2.Rendering.Shaders.AddColor.mgfx" />
   </ItemGroup>
+  <!-- Gum/KernSmith come from the sibling Gum clone as ProjectReferences; see Gum.Source.props. -->
+  <PropertyGroup>
+    <FrbGumBackend>Kni</FrbGumBackend>
+  </PropertyGroup>
+  <Import Project="../../Gum.Source.props" />
 </Project>
