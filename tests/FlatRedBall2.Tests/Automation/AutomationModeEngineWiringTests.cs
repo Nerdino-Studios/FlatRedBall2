@@ -155,6 +155,65 @@ public class AutomationModeEngineWiringTests
         }
     }
 
+    /// <summary>
+    /// A cursor click reaching a Button through the engine's own Gum update: the roots list, the
+    /// per-frame cursor install and Gum's dispatch, all inside real game ticks. The headless tests
+    /// in AutomationGumFormsTests.cs drive Gum directly; this covers the engine wiring around it.
+    /// </summary>
+    [Fact]
+    public void CursorCommand_ThroughRealGameTicks_ClicksOverlayButtonExactlyOnce()
+    {
+        if (GumIsOwnedElsewhere)
+            return;
+
+        using var game = TryCreateGame();
+        if (game is null)
+            return;
+
+        var engine = new FlatRedBallService();
+        engine.Initialize(game);
+        engine.Start<Screen>();
+        game.Engine = engine;
+
+        try
+        {
+            // Fills the overlay, so the click lands however the 64x64 window maps onto the canvas.
+            var button = new Gum.Forms.Controls.Button();
+            button.Visual.WidthUnits = Gum.DataTypes.DimensionUnitType.RelativeToParent;
+            button.Visual.HeightUnits = Gum.DataTypes.DimensionUnitType.RelativeToParent;
+            button.Width = 0;
+            button.Height = 0;
+            engine.CurrentScreen.AddOverlay(button);
+            var clicks = 0;
+            button.Click += (_, _) => clicks++;
+
+            // The recommended ordering: move with the button up, push, release, each on its own
+            // stepped frame. Extra steps while held and after release must not add clicks.
+            var commands =
+                "{\"cmd\":\"input\",\"type\":\"cursor\",\"x\":32,\"y\":32}\n" +
+                "{\"cmd\":\"step\"}\n" +
+                "{\"cmd\":\"input\",\"type\":\"cursor\",\"x\":32,\"y\":32,\"primary\":true}\n" +
+                "{\"cmd\":\"step\",\"count\":3}\n" +
+                "{\"cmd\":\"input\",\"type\":\"cursor\",\"x\":32,\"y\":32}\n" +
+                "{\"cmd\":\"step\",\"count\":10}\n";
+            var output = new StringWriter();
+            engine.StartAutomationMode(seed: 0, input: new StringReader(commands), output: output);
+
+            // 14 step responses means every frame above has run.
+            for (int i = 0; i < 200 && output.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Length < 14; i++)
+            {
+                game.RunOneFrame();
+                System.Threading.Thread.Sleep(5);
+            }
+
+            clicks.ShouldBe(1);
+        }
+        finally
+        {
+            engine.Shutdown();
+        }
+    }
+
     [Fact]
     public void StepCountThenScreenshot_ThroughRealGameTicks_FlushesFromDrawAndCapturesWithoutAStep()
     {

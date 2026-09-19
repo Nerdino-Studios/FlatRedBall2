@@ -148,38 +148,17 @@ public class AutomationModeTextCommandTests
     }
 }
 
-// --- Installing the keyboard into Gum, and the engine tick that does it ---
+// --- Installing the keyboard and cursor into Gum, and the engine tick that does it ---
 
-public class AutomationGumKeyboardInstallTests
+// Installs into Gum's static input slots, so it lives with the other Gum-static tests.
+[Collection(HeadlessGumFormsCollection.Name)]
+public class AutomationGumInputInstallTests
 {
     [Fact]
-    public void EnsureGumKeyboardInstalled_AfterSomethingElseReplacesTheKeyboard_ReinstallsIt()
+    public void EngineUpdate_WithAutomationActive_InstallsTheAutomationKeyboardAndCursorIntoGumForms()
     {
-        var previous = Gum.Forms.FormsUtilities.Keyboard;
-        try
-        {
-            var mode = new AutomationMode(new FlatRedBallService(), new StringWriter());
-
-            mode.EnsureGumKeyboardInstalled();
-            Gum.Forms.FormsUtilities.Keyboard.ShouldBeSameAs(mode.GumKeyboard);
-
-            // Stands in for FormsUtilities.InitializeDefaults / Uninitialize, either of which
-            // overwrites the field depending on when the game calls Initialize.
-            Gum.Forms.FormsUtilities.SetKeyboard(null!);
-            mode.EnsureGumKeyboardInstalled();
-
-            Gum.Forms.FormsUtilities.Keyboard.ShouldBeSameAs(mode.GumKeyboard);
-        }
-        finally
-        {
-            Gum.Forms.FormsUtilities.SetKeyboard(previous);
-        }
-    }
-
-    [Fact]
-    public void EngineUpdate_WithAutomationActive_InstallsTheAutomationKeyboardIntoGumForms()
-    {
-        var previous = Gum.Forms.FormsUtilities.Keyboard;
+        var previousKeyboard = Gum.Forms.FormsUtilities.Keyboard;
+        var previousCursor = Gum.Forms.FormsUtilities.Cursor;
         var engine = new FlatRedBallService();
         try
         {
@@ -200,11 +179,13 @@ public class AutomationGumKeyboardInstallTests
             // StartAutomationMode deliberately does not install, so only the update tick can
             // make this pass.
             Gum.Forms.FormsUtilities.Keyboard.ShouldBeOfType<AutomationGumKeyboard>();
+            Gum.Forms.FormsUtilities.Cursor.ShouldBeOfType<AutomationGumCursor>();
         }
         finally
         {
             engine.Shutdown();
-            Gum.Forms.FormsUtilities.SetKeyboard(previous);
+            Gum.Forms.FormsUtilities.SetKeyboard(previousKeyboard);
+            Gum.Forms.FormsUtilities.SetCursor(previousCursor);
         }
     }
 
@@ -224,6 +205,35 @@ public class AutomationGumKeyboardInstallTests
         finally
         {
             engine.Shutdown();
+        }
+    }
+
+    [Fact]
+    public void EnsureGumInputInstalled_AfterSomethingElseReplacesKeyboardAndCursor_ReinstallsBoth()
+    {
+        var previousKeyboard = Gum.Forms.FormsUtilities.Keyboard;
+        var previousCursor = Gum.Forms.FormsUtilities.Cursor;
+        try
+        {
+            var mode = new AutomationMode(new FlatRedBallService(), new StringWriter());
+
+            mode.EnsureGumInputInstalled();
+            Gum.Forms.FormsUtilities.Keyboard.ShouldBeSameAs(mode.GumKeyboard);
+            Gum.Forms.FormsUtilities.Cursor.ShouldBeSameAs(mode.GumCursor);
+
+            // Stands in for FormsUtilities.InitializeDefaults / Uninitialize, either of which
+            // overwrites both fields depending on when the game calls Initialize.
+            Gum.Forms.FormsUtilities.SetKeyboard(null!);
+            Gum.Forms.FormsUtilities.SetCursor(null!);
+            mode.EnsureGumInputInstalled();
+
+            Gum.Forms.FormsUtilities.Keyboard.ShouldBeSameAs(mode.GumKeyboard);
+            Gum.Forms.FormsUtilities.Cursor.ShouldBeSameAs(mode.GumCursor);
+        }
+        finally
+        {
+            Gum.Forms.FormsUtilities.SetKeyboard(previousKeyboard);
+            Gum.Forms.FormsUtilities.SetCursor(previousCursor);
         }
     }
 }
