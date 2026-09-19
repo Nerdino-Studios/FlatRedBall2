@@ -1472,9 +1472,10 @@ public class FlatRedBallService
         _frameProfile.InputMs = ProfileClock.Ms(tInput, System.Diagnostics.Stopwatch.GetTimestamp());
 
         // Input state for this frame is now current, so point Gum Forms at it before anything
-        // reads the focused control. Deliberately outside the _spriteBatch guard below: the
-        // install is pure state and must not depend on a graphics device existing.
-        _automationMode?.EnsureGumKeyboardInstalled();
+        // hit-tests the cursor or reads the focused control. Deliberately outside the
+        // _spriteBatch guard below: the install is pure state and must not depend on a graphics
+        // device existing.
+        _automationMode?.EnsureGumInputInstalled();
 
         _frameProfile.AudioMs = 0;
         _frameProfile.GumUpdateMs = 0;

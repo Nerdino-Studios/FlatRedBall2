@@ -71,6 +71,16 @@ no change to how Gum routes focus.
 This is a general-purpose seam (virtual keyboards, IME, accessibility, remote input), not a test
 hook, which is what makes it reasonable to land upstream.
 
+## The cursor half
+
+Gum's `MonoGameGum.Input.Cursor` has the same shape of problem: `Activity` polls
+`Mouse.GetState()` directly, so an injected FRB2 cursor moved `Engine.Input.Cursor` for gameplay
+code but could not press a Gum `Button` or focus a `TextBox`. `SetCursor` already existed, so
+`AutomationGumCursor` (`src/Automation/AutomationGumCursor.cs`) implements `Gum.Wireframe.ICursor`
+over the FRB2 cursor and `AutomationMode.EnsureGumInputInstalled` installs both halves each frame.
+Edges are read live from the FRB2 cursor, which the engine polls before Gum's update, so one
+injected press/release across any number of stepped frames is one push and one click.
+
 ## Consequences to keep in mind
 
 - `MonoGameGum.GumService.Keyboard` is `(FormsUtilities.Keyboard as Keyboard)!` — it returns

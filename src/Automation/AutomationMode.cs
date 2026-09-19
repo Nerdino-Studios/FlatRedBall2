@@ -34,10 +34,12 @@ internal class AutomationMode
     // Game-thread only — no synchronization needed.
     private int _pendingStepCount;
     private bool _stepConsumedThisFrame;
-    // The keyboard handed to Gum Forms so injected keys/text reach the focused control. Created
-    // eagerly with the session (not on first use) so ordering never matters: the install into
-    // Gum is re-asserted every frame by EnsureGumKeyboardInstalled.
+    // The keyboard and cursor handed to Gum Forms so injected keys/text reach the focused control
+    // and injected cursor state can hover, push, click and focus controls. Created eagerly with
+    // the session (not on first use) so ordering never matters: the install into Gum is
+    // re-asserted every frame by EnsureGumInputInstalled.
     private readonly AutomationGumKeyboard _gumKeyboard;
+    private readonly AutomationGumCursor _gumCursor;
 
     // Armed by "record_next_screenshot", consumed by the first Draw() that follows. Screenshots
     // can't be captured inline like query/set — the back buffer for the frame the caller cares
@@ -48,6 +50,7 @@ internal class AutomationMode
     {
         _engine = engine;
         _gumKeyboard = new AutomationGumKeyboard(engine.Input.Keyboard);
+        _gumCursor = new AutomationGumCursor(engine.Input.Cursor);
         _output = output ?? Console.Out;
         // stderr, not Debug.WriteLine: this log exists to explain a session that is producing no
         // responses, and a debugger listener is invisible to whoever is driving the pipe. stdout is
@@ -176,25 +179,33 @@ internal class AutomationMode
 
     /// <summary>
     /// The keyboard this session feeds to Gum Forms. Exposed for tests; production code reaches
-    /// it through <see cref="EnsureGumKeyboardInstalled"/>.
+    /// it through <see cref="EnsureGumInputInstalled"/>.
     /// </summary>
     internal AutomationGumKeyboard GumKeyboard => _gumKeyboard;
 
     /// <summary>
-    /// Installs this session's keyboard into Gum Forms if it is not already the active one.
-    /// Called every frame before Gum's update.
+    /// The cursor this session feeds to Gum Forms. Exposed for tests; production code reaches
+    /// it through <see cref="EnsureGumInputInstalled"/>.
+    /// </summary>
+    internal AutomationGumCursor GumCursor => _gumCursor;
+
+    /// <summary>
+    /// Installs this session's keyboard and cursor into Gum Forms if they are not already the
+    /// active ones. Called every frame after FRB2 input is polled and before Gum's update.
     /// </summary>
     /// <remarks>
-    /// Re-asserted per frame rather than once at startup because Gum owns the field: both
-    /// <c>FormsUtilities.InitializeDefaults</c> and <c>Uninitialize</c> overwrite it, and whether
+    /// Re-asserted per frame rather than once at startup because Gum owns the fields: both
+    /// <c>FormsUtilities.InitializeDefaults</c> and <c>Uninitialize</c> overwrite them, and whether
     /// either runs before or after automation starts depends on the order the game calls
     /// <c>Initialize</c> and <c>EnableAutomationMode</c>. A reference comparison per frame costs
     /// nothing and removes that ordering dependency entirely.
     /// </remarks>
-    internal void EnsureGumKeyboardInstalled()
+    internal void EnsureGumInputInstalled()
     {
         if (!ReferenceEquals(Gum.Forms.FormsUtilities.Keyboard, _gumKeyboard))
             Gum.Forms.FormsUtilities.SetKeyboard(_gumKeyboard);
+        if (!ReferenceEquals(Gum.Forms.FormsUtilities.Cursor, _gumCursor))
+            Gum.Forms.FormsUtilities.SetCursor(_gumCursor);
     }
 
     internal void RegisterStateProvider(string name, Func<object> provider)
