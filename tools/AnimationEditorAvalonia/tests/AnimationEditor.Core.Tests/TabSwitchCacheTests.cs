@@ -146,7 +146,7 @@ public class TabSwitchCacheTests : IDisposable
             set => _inner.TileMapInformationList = value;
         }
 
-        public FilePath[] ReferencedPngs => _inner.ReferencedPngs;
+        public FilePath[] ReferencedPngs { get => _inner.ReferencedPngs; set => _inner.ReferencedPngs = value; }
         public string? FileName { get => _inner.FileName; set => _inner.FileName = value; }
         public string? ProjectFolderPath { get => _inner.ProjectFolderPath; set => _inner.ProjectFolderPath = value; }
         public TextureCoordinateType OnDiskCoordinateType
@@ -160,6 +160,11 @@ public class TabSwitchCacheTests : IDisposable
         public void LoadTsxProject(FilePath fileName) => _inner.LoadTsxProject(fileName);
         public void SaveTsxProject(string? targetPath = null) => _inner.SaveTsxProject(targetPath);
         public IReadOnlyList<string> GetChainNamesWithTsxIssues() => _inner.GetChainNamesWithTsxIssues();
+        public object? CaptureTsxState() => _inner.CaptureTsxState();
+        public void RestoreTsxState(object? state) => _inner.RestoreTsxState(state);
+        public object? CaptureTextureSizeState() => _inner.CaptureTextureSizeState();
+        public void RestoreTextureSizeState(object? state) => _inner.RestoreTextureSizeState(state);
+        public void ResetToBlankDocument() => _inner.ResetToBlankDocument();
 
         public void LoadAnimationChain(
             FilePath fileName,

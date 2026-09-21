@@ -1,5 +1,6 @@
 using AnimationEditor.Core.Tiled;
 using DotTiled;
+using System;
 using System.Linq;
 using Xunit;
 
@@ -110,6 +111,42 @@ public class TilesetAnimationSyncTests
     }
 
     [Fact]
+    public void Apply_StaleClearExistingUpdateAndNewTileAllInOneCall_DictionaryLookupMatchesSequentialScan()
+    {
+        // Exercises Apply's dictionary-based tile lookup against all three code paths in a single
+        // call: a stale tile that must be found and cleared, an existing tile that must be found
+        // and updated, and a brand-new tile added mid-loop -- pinning that the O(1) dictionary
+        // lookup (built once from tileset.Tiles at the top of Apply) produces the exact same
+        // result as the prior O(n) Single/FirstOrDefault scan of tileset.Tiles.
+        var tileset = EmptyTileset();
+        var firstSync = new[]
+        {
+            Result("Walk", 0, new MappedFrame(0, 100)),
+            Result("Old", 5, new MappedFrame(5, 100)),
+        };
+        TilesetAnimationSync.Apply(tileset, firstSync, SourceLabel);
+
+        var secondSync = new[]
+        {
+            Result("Walk", 0, new MappedFrame(0, 200), new MappedFrame(1, 200)),
+            Result("New", 10, new MappedFrame(10, 100)),
+        };
+        var syncResult = TilesetAnimationSync.Apply(tileset, secondSync, SourceLabel);
+
+        var updatedTile = tileset.Tiles.Single(t => t.ID == 0);
+        Assert.Equal([((uint)0, 200), ((uint)1, 200)], updatedTile.Animation.Select(f => (f.TileID, f.Duration)));
+
+        var staleTile = tileset.Tiles.Single(t => t.ID == 5);
+        Assert.Empty(staleTile.Animation);
+        Assert.DoesNotContain(staleTile.Properties, p => p.Name is "achjAnimationName" or "achjSourceFile");
+
+        var newTile = tileset.Tiles.Single(t => t.ID == 10);
+        Assert.Equal([((uint)10, 100)], newTile.Animation.Select(f => (f.TileID, f.Duration)));
+
+        Assert.True(syncResult.Changed);
+    }
+
+    [Fact]
     public void Apply_UpdatedChainTiming_ReplacesFramesOnSameTile()
     {
         var tileset = EmptyTileset();
@@ -122,5 +159,116 @@ public class TilesetAnimationSyncTests
         var tile = tileset.Tiles.Single(t => t.ID == 0);
         Assert.All(tile.Animation, f => Assert.Equal(250, f.Duration));
         Assert.True(syncResult.Changed);
+    }
+
+    [Fact]
+    public void Apply_TwoChainsInSameSourceClaimSameEntryTile_ThrowsInsteadOfSilentlyOverwriting()
+    {
+        var tileset = EmptyTileset();
+        var results = new[]
+        {
+            Result("Walk", 0, new MappedFrame(0, 100)),
+            Result("Idle", 0, new MappedFrame(4, 100)),
+        };
+
+        Assert.Throws<InvalidOperationException>(() => TilesetAnimationSync.Apply(tileset, results, SourceLabel));
+    }
+
+    [Fact]
+    public void Apply_TileOwnedByDifferentSource_IsSkippedNotOverwritten()
+    {
+        var tileset = EmptyTileset();
+        var firstSourceResults = new[] { Result("Walk", 0, new MappedFrame(0, 999)) };
+        TilesetAnimationSync.Apply(tileset, firstSourceResults, "../Hero.achx");
+
+        // A different achx's geometry happens to compute the same entry tile id.
+        var secondSourceResults = new[] { Result("Idle", 0, new MappedFrame(4, 100)) };
+        var syncResult = TilesetAnimationSync.Apply(tileset, secondSourceResults, "../OtherChain.achx");
+
+        var tile = tileset.Tiles.Single(t => t.ID == 0);
+        Assert.Equal(999, tile.Animation.Single().Duration);
+        Assert.Equal("../Hero.achx", tile.GetProperty<StringProperty>("achjSourceFile").Value);
+        Assert.Equal(0, syncResult.AppliedCount);
+        Assert.Contains(syncResult.Warnings, w => w.Contains("already owned by"));
+    }
+
+    [Fact]
+    public void Apply_TileHasHandAuthoredAnimationNoSourceProperty_IsSkippedNotOverwritten()
+    {
+        var tileset = EmptyTileset();
+        var handAuthoredTile = new Tile { ID = 0, Width = 0, Height = 0 };
+        handAuthoredTile.Animation.Add(new Frame { TileID = 0, Duration = 999 });
+        // No achjSourceFile/achjAnimationName property at all -- this tile was never touched by
+        // any achx sync; a human drew its keyframes directly in Tiled.
+        tileset.Tiles.Add(handAuthoredTile);
+
+        // This achx chain's frame geometry happens to compute the same entry tile id.
+        var results = new[] { Result("Walk", 0, new MappedFrame(4, 100)) };
+        var syncResult = TilesetAnimationSync.Apply(tileset, results, SourceLabel);
+
+        var tile = tileset.Tiles.Single(t => t.ID == 0);
+        Assert.Equal(999, tile.Animation.Single().Duration);
+        Assert.DoesNotContain(tile.Properties, p => p.Name is "achjAnimationName" or "achjSourceFile");
+        Assert.Equal(0, syncResult.AppliedCount);
+        Assert.Contains(syncResult.Warnings, w => w.Contains("hand-authored") || w.Contains("already owned"));
+    }
+
+    [Fact]
+    public void Apply_TileHasStaleAnimationNamePropertyButEmptyAnimationAndNoSourceProperty_IsClaimedNotPermanentlyBlocked()
+    {
+        var tileset = EmptyTileset();
+        var staleTile = new Tile { ID = 0, Width = 0, Height = 0 };
+        // Simulates a partially-written/crashed save or a pre-achjSourceFile schema version:
+        // achjAnimationName survived but the animation frames and achjSourceFile did not.
+        // Deliberately NOT treated as "owned" the way a tile with actual Animation.Count > 0 is
+        // (see Apply_TileHasHandAuthoredAnimationNoSourceProperty_IsSkippedNotOverwritten above) --
+        // there is no achjSourceFile value a future sync could ever match to un-block this tile, so
+        // keying the ownership check off achjAnimationName alone would make it permanently
+        // unreclaimable (skip+warn forever, never able to write achjSourceFile to satisfy its own
+        // check). With no actual animation data at risk, self-healing by claiming and overwriting
+        // the stale name is safer than a warning that can never resolve.
+        staleTile.Properties.Add(new StringProperty { Name = "achjAnimationName", Value = "OldChain" });
+        tileset.Tiles.Add(staleTile);
+
+        var results = new[] { Result("Walk", 0, new MappedFrame(4, 100)) };
+        var syncResult = TilesetAnimationSync.Apply(tileset, results, SourceLabel);
+
+        var tile = tileset.Tiles.Single(t => t.ID == 0);
+        Assert.Equal(1, syncResult.AppliedCount);
+        Assert.Equal("Walk", tile.GetProperty<StringProperty>("achjAnimationName").Value);
+        Assert.Equal(SourceLabel, tile.GetProperty<StringProperty>("achjSourceFile").Value);
+    }
+
+    [Fact]
+    public void Apply_ExistingAnimationNamePropertyHasWrongType_IsReplacedNotDuplicated()
+    {
+        var tileset = EmptyTileset();
+        var tile = new Tile { ID = 0, Width = 0, Height = 0 };
+        tile.Properties.Add(new IntProperty { Name = "achjAnimationName", Value = 42 });
+        tileset.Tiles.Add(tile);
+
+        var results = new[] { Result("Walk", 0, new MappedFrame(0, 100)) };
+        TilesetAnimationSync.Apply(tileset, results, SourceLabel);
+
+        var matching = tile.Properties.Where(p => p.Name == "achjAnimationName").ToList();
+        var single = Assert.Single(matching);
+        var stringProperty = Assert.IsType<StringProperty>(single);
+        Assert.Equal("Walk", stringProperty.Value);
+    }
+
+    [Fact]
+    public void Apply_TilesetHasDuplicateTileIds_ThrowsClearErrorInsteadOfRawDictionaryException()
+    {
+        // Apply builds a tile-id-keyed dictionary once up front (for O(1) lookups). A corrupt/
+        // hand-edited tsx with two <tile> elements sharing one id used to hit .ToDictionary's own
+        // unchecked ArgumentException instead of this codebase's "fail loud with a clear message"
+        // precedent (Columns<=0, tile-id collisions between chains, etc).
+        var tileset = EmptyTileset();
+        tileset.Tiles.Add(new Tile { ID = 5, Width = 0, Height = 0 });
+        tileset.Tiles.Add(new Tile { ID = 5, Width = 0, Height = 0 });
+
+        var exception = Assert.Throws<InvalidOperationException>(() => TilesetAnimationSync.Apply(tileset, [], SourceLabel));
+
+        Assert.Contains("5", exception.Message);
     }
 }

@@ -6,14 +6,20 @@ using System.Linq;
 
 namespace AnimationEditor.Core.Tiled;
 
-/// <summary>One satellite tile of a multi-tile animation group: its own (fixed) tile id and the
-/// per-frame tile id sequence it should carry as its own Tiled animation.</summary>
-public sealed record TiledSatelliteMapping(uint TileId, IReadOnlyList<MappedFrame> Frames);
+/// <summary>One satellite tile of a multi-tile animation group: its own (fixed) tile id, the
+/// per-frame tile id sequence it should carry as its own Tiled animation, and its position within
+/// the footprint relative to the anchor (used to key <c>knownSatelliteTileIds</c> hints across
+/// saves -- see <see cref="MultiTileToTiledAnimationMapper.Map"/>).</summary>
+public sealed record TiledSatelliteMapping(uint TileId, IReadOnlyList<MappedFrame> Frames, (int Dx, int Dy) Offset);
 
 /// <summary>Result of mapping one <see cref="AnimationChainSave"/> that may span more than one
 /// tile cell per frame onto a tileset's tile grid.</summary>
 public sealed record MultiTileMappingResult
 {
+    /// <summary>The chain this result came from, by reference -- lets a caller (<see
+    /// cref="AnimationEditor.Core.ProjectManager"/>) record "this chain owns this tile id" keyed
+    /// on identity instead of on <see cref="ChainName"/>, which changes on a rename.</summary>
+    public required AnimationChainSave SourceChain { get; init; }
     public required string ChainName { get; init; }
     /// <summary>The entry/anchor tile's own per-frame tile id sequence (top-left cell of the footprint).</summary>
     public required IReadOnlyList<MappedFrame> AnchorFrames { get; init; }
@@ -44,20 +50,39 @@ public static class MultiTileToTiledAnimationMapper
 {
     private const float Epsilon = 0.001f;
 
+    /// <param name="knownEntryTileIds">Optional identity hint from a prior <see
+    /// cref="TiledAnimationToAchjMapper.Map"/> load (or a prior save -- see <see
+    /// cref="AnimationEditor.Core.ProjectManager"/>'s own tracking), keyed by chain object
+    /// reference. When a chain has an entry here, that tile id wins over the freshly-computed
+    /// first-frame id -- without this, every save relocates any chain whose owning tile isn't its
+    /// own first frame (an ordinary hand-authored Tiled pattern), orphaning the original tile.</param>
+    /// <param name="knownSatelliteTileIds">The satellite equivalent of <paramref
+    /// name="knownEntryTileIds"/>: each chain's satellites' own on-disk tile ids, keyed by chain
+    /// reference then by the satellite's (Dx, Dy) offset within the footprint. A satellite's tile
+    /// id is otherwise always recomputed as the anchor's *frame-0* position plus its offset -- a
+    /// different base than the anchor's own (possibly hint-preserved) tile id whenever the anchor's
+    /// id isn't its own frame-0 tile, which silently drifts the satellite to a new tile every save
+    /// without this hint.</param>
     public static IReadOnlyList<MultiTileMappingResult> Map(
-        AnimationChainListSave achj, TilesetAnimationInfo tilesetInfo)
+        AnimationChainListSave achj, TilesetAnimationInfo tilesetInfo,
+        IReadOnlyDictionary<AnimationChainSave, uint>? knownEntryTileIds = null,
+        IReadOnlyDictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>>? knownSatelliteTileIds = null)
     {
         return achj.AnimationChains
-            .Select(chain => MapChain(chain, achj.CoordinateType, achj.TimeMeasurementUnit, tilesetInfo))
+            .Select(chain => MapChain(
+                chain, achj.CoordinateType, achj.TimeMeasurementUnit, tilesetInfo, knownEntryTileIds,
+                knownSatelliteTileIds != null && knownSatelliteTileIds.TryGetValue(chain, out var hints) ? hints : null))
             .ToList();
     }
 
     private static MultiTileMappingResult MapChain(
         AnimationChainSave chain, TextureCoordinateType coordinateType, TimeMeasurementUnit timeUnit,
-        TilesetAnimationInfo tilesetInfo)
+        TilesetAnimationInfo tilesetInfo, IReadOnlyDictionary<AnimationChainSave, uint>? knownEntryTileIds,
+        IReadOnlyDictionary<(int Dx, int Dy), uint>? knownSatelliteTileIds)
     {
         MultiTileMappingResult Empty(string? warning = null) => new()
         {
+            SourceChain = chain,
             ChainName = chain.Name,
             AnchorFrames = [],
             EntryTileId = null,
@@ -106,6 +131,27 @@ public static class MultiTileToTiledAnimationMapper
             var originColumn = (int)Math.Round(rect.Left / tilesetInfo.TileWidth);
             var originRow = (int)Math.Round(rect.Top / tilesetInfo.TileHeight);
 
+            // An exact negative multiple of the tile size (e.g. -16 with a 16px tile) passes the
+            // grid-alignment check above (remainder is 0) yet resolves to a negative
+            // column/row -- an unchecked cast to uint below would wrap to a huge bogus tile id.
+            if (originColumn < 0 || originRow < 0)
+                return Empty($"chain \"{chain.Name}\": frame rect origin ({rect.Left}, {rect.Top}) resolves to a negative column/row, which isn't a valid tile position - skipped.");
+
+            // A footprint whose right-hand cell would need a column at or past the tileset's own
+            // column count still computes a "valid"-looking tileId for that cell -- it just lands
+            // on a real tile in the *next* row instead of failing, silently misplacing a satellite
+            // onto an unrelated tile every save.
+            if (originColumn + footprintColumns > tilesetInfo.ColumnCount)
+                return Empty($"chain \"{chain.Name}\": frame rect origin ({rect.Left}, {rect.Top}) with a {footprintColumns}x{footprintRows}-tile footprint would extend past the tileset's {tilesetInfo.ColumnCount} column(s) - skipped.");
+
+            // The footprint's bottom-right cell (the largest tile id any cell in this footprint can
+            // compute to, since the column bound above already guarantees every cell's column is
+            // in range) doesn't wrap into an existing tile the way column overflow does -- it's
+            // simply past the tileset's declared tile count, including a partial last row.
+            var maxTileId = (uint)(((originRow + footprintRows - 1) * tilesetInfo.ColumnCount) + (originColumn + footprintColumns - 1));
+            if (maxTileId >= tilesetInfo.TileCount)
+                return Empty($"chain \"{chain.Name}\": frame rect origin ({rect.Left}, {rect.Top}) with a {footprintColumns}x{footprintRows}-tile footprint would extend past the tileset's {tilesetInfo.TileCount} tile(s) - skipped.");
+
             for (var dy = 0; dy < footprintRows; dy++)
                 for (var dx = 0; dx < footprintColumns; dx++)
                 {
@@ -117,14 +163,27 @@ public static class MultiTileToTiledAnimationMapper
         var anchorFrames = perOffset[(0, 0)];
         var satellites = perOffset
             .Where(kv => kv.Key != (0, 0))
-            .Select(kv => new TiledSatelliteMapping(kv.Value[0].TileId, kv.Value))
+            .Select(kv =>
+            {
+                var tileId = knownSatelliteTileIds != null && knownSatelliteTileIds.TryGetValue(kv.Key, out var known)
+                    ? known
+                    : kv.Value[0].TileId;
+                return new TiledSatelliteMapping(tileId, kv.Value, kv.Key);
+            })
             .ToList();
+
+        uint? entryTileId = null;
+        if (anchorFrames.Count > 0)
+            entryTileId = knownEntryTileIds != null && knownEntryTileIds.TryGetValue(chain, out var known)
+                ? known
+                : anchorFrames[0].TileId;
 
         return new MultiTileMappingResult
         {
+            SourceChain = chain,
             ChainName = chain.Name,
             AnchorFrames = anchorFrames,
-            EntryTileId = anchorFrames.Count > 0 ? anchorFrames[0].TileId : null,
+            EntryTileId = entryTileId,
             Satellites = satellites,
             Warnings = [],
         };

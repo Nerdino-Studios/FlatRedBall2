@@ -23,7 +23,7 @@ namespace AnimationEditor.Core
             set => mTileMapInformationList = value;
         }
 
-        public FilePath[] ReferencedPngs { get; private set; } = new FilePath[0];
+        public FilePath[] ReferencedPngs { get; set; } = new FilePath[0];
 
         public string? FileName { get; set; }
 
@@ -35,9 +35,66 @@ namespace AnimationEditor.Core
         /// </summary>
         private DotTiled.Tileset? _tsxTileset;
 
+        /// <summary>Each native-tsx chain's own tile id, keyed by chain object reference (survives
+        /// a rename, unlike keying by name) -- populated on <see cref="LoadTsxProject"/> from what
+        /// the file already said, and kept current after every <see cref="SaveTsxProject"/> so a
+        /// brand-new chain's first-save id keeps being reused on every later save instead of being
+        /// recomputed (and potentially drifting) from geometry each time. See <see
+        /// cref="Tiled.MultiTileToTiledAnimationMapper"/>'s <c>knownEntryTileIds</c> parameter.</summary>
+        private Dictionary<AnimationChainSave, uint> _tsxEntryTileIdsByChain = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>The satellite equivalent of <see cref="_tsxEntryTileIdsByChain"/>: each
+        /// chain's satellites' own tile ids, keyed by chain reference then by the satellite's
+        /// (Dx, Dy) offset within the footprint. Without this, a satellite's tile id is always
+        /// recomputed relative to the anchor's *frame-0* position -- a different base than the
+        /// anchor's own (possibly hint-preserved) tile id whenever the anchor's id isn't its own
+        /// frame-0 tile, silently drifting the satellite to a new tile every save. See <see
+        /// cref="Tiled.MultiTileToTiledAnimationMapper"/>'s <c>knownSatelliteTileIds</c> parameter.</summary>
+        private Dictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>> _tsxSatelliteTileIdsByChain = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Each chain's own <see cref="AnimationChainSave.Frames"/> contents as of the
+        /// most recent save where it had a real (non-null) entry tile id -- i.e. the frame-object
+        /// sequence that produced <see cref="_tsxEntryTileIdsByChain"/>'s current value for that
+        /// chain. Used only to seed a <see cref="DormantTsxHint"/> the moment a chain's frames go
+        /// from non-empty to empty (see <see cref="_tsxDormantHintsByChain"/>).</summary>
+        private Dictionary<AnimationChainSave, IReadOnlyList<AnimationFrameSave>> _tsxLastNonEmptyFramesByChain = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>A chain's tile-identity hint, held onto after <see cref="SaveTsxProject"/> sees
+        /// its <see cref="AnimationChainSave.Frames"/> go empty, so a later save can tell apart two
+        /// scenarios that otherwise look identical (chain still present in <see
+        /// cref="AnimationChainListSave"/>, entry tile id null on the intervening save):
+        /// <c>DeleteFramesCommand</c>'s <c>Undo()</c> re-inserting the exact same frame objects it
+        /// just removed (must restore the original tile), vs. the user genuinely re-authoring the
+        /// chain with different frame content afterward (must
+        /// compute fresh, per <c>SaveTsxProject_AllFramesDeletedFromChain_...</c>). Neither <see
+        /// cref="AnimationFrameSave"/> nor <see cref="AnimationChainSave"/> is ever cloned by
+        /// undo/redo in this codebase, so comparing the current frame list against <see cref="
+        /// DormantTsxHint.Frames"/> by object reference (not value) is a reliable "is this the same
+        /// Undo?" test.</summary>
+        private Dictionary<AnimationChainSave, DormantTsxHint> _tsxDormantHintsByChain = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>See <see cref="_tsxDormantHintsByChain"/>.</summary>
+        private sealed record DormantTsxHint(
+            uint EntryTileId,
+            IReadOnlyDictionary<(int Dx, int Dy), uint> Satellites,
+            IReadOnlyList<AnimationFrameSave> Frames);
+
         /// <summary>Whether the currently loaded project is a native <c>.tsx</c> project (see
         /// <see cref="LoadTsxProject"/>) rather than an achx/achj project.</summary>
         public bool IsNativeTsxProject => _tsxTileset != null;
+
+        /// <summary>Guards every achx/achj-format save method (<see
+        /// cref="SaveAnimationChainList(string)"/>, its <see cref="Stream"/> overload, and <see
+        /// cref="SaveAnimationChainListAsync"/>) against being called on a native tsx project --
+        /// defense-in-depth alongside <c>AppCommands.SaveCurrentAnimationChainList</c>'s own branch
+        /// on <see cref="IsNativeTsxProject"/>, for any caller that reaches <see
+        /// cref="ProjectManager"/> directly instead.</summary>
+        private void ThrowIfNativeTsxProject()
+        {
+            if (IsNativeTsxProject)
+                throw new InvalidOperationException(
+                    "Cannot save a native tsx project via SaveAnimationChainList -- use SaveTsxProject instead.");
+        }
 
         /// <summary>The tsx's own fixed tile size, or <see langword="null"/> for an achx/achj
         /// project. A native tsx project's grid size is always this -- it is not user-configurable
@@ -68,6 +125,9 @@ namespace AnimationEditor.Core
         /// around so <see cref="SaveAnimationChainList(Stream)"/> can convert back to Pixel
         /// coordinates without a filesystem to re-read PNG headers from (the browser-wasm build
         /// has no disk at all, unlike <see cref="SaveAnimationChainList(string)"/>'s directory).
+        /// Plain per-load instance state with no public getter, same shape as the tsx fields
+        /// below -- see <see cref="CaptureTextureSizeState"/>/<see cref="RestoreTextureSizeState"/>
+        /// for why a tab-switch cache also needs to round-trip this.
         /// </summary>
         private IReadOnlyDictionary<string, (int Width, int Height)>? _knownTextureSizes;
 
@@ -112,8 +172,24 @@ namespace AnimationEditor.Core
             AnimationChainListSave = acls;
             FileName = fileName.FullPath;
 
+            // This ProjectManager instance is reused across File > Open calls (one instance per
+            // app window/tab-set, not recreated per file -- see TabSwitchCacheTests), so a prior
+            // LoadTsxProject's tileset/identity-tracking state must not leak into a now-plain achx
+            // project: IsNativeTsxProject must go false, or SaveCurrentAnimationChainList would
+            // route this achx's save through SaveTsxProject against the stale tileset.
+            _tsxTileset = null;
+            _tsxEntryTileIdsByChain = new Dictionary<AnimationChainSave, uint>(ReferenceEqualityComparer.Instance);
+            _tsxSatelliteTileIdsByChain = new Dictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>>(ReferenceEqualityComparer.Instance);
+            _tsxLastNonEmptyFramesByChain = new Dictionary<AnimationChainSave, IReadOnlyList<AnimationFrameSave>>(ReferenceEqualityComparer.Instance);
+            _tsxDormantHintsByChain = new Dictionary<AnimationChainSave, DormantTsxHint>(ReferenceEqualityComparer.Instance);
+
+            // Same reused-instance hazard as the tsx fields just above: ReferencedPngs is driven
+            // entirely by the *current* achx's own ProjectFile reference, so a file with none must
+            // clear whatever a previously loaded achx populated here rather than leaving it stale.
             if (!string.IsNullOrEmpty(acls.ProjectFile))
                 TryLoadProjectFile(new FilePath(fileName.GetDirectoryContainingThis().FullPath + acls.ProjectFile));
+            else
+                ReferencedPngs = new FilePath[0];
         }
 
         /// <summary>
@@ -148,8 +224,14 @@ namespace AnimationEditor.Core
         /// any texture size); when writing as Pixel, this method converts just for the
         /// on-disk write and then converts back so the in-memory model stays UV.
         /// </summary>
+        /// <exception cref="InvalidOperationException"><see cref="IsNativeTsxProject"/> is true --
+        /// <see cref="AnimationChainListSave"/> is a view over Tiled tileset data for a native tsx
+        /// project, not a real achx/achj document, so writing it through this method would produce
+        /// malformed/misleading content. Use <see cref="SaveTsxProject"/> instead.</exception>
         public void SaveAnimationChainList(string targetPath)
         {
+            ThrowIfNativeTsxProject();
+
             var acls = AnimationChainListSave;
             if (acls == null) return;
 
@@ -188,8 +270,12 @@ namespace AnimationEditor.Core
         /// on this overload. A texture missing from that dictionary is left in UV coordinates,
         /// same as the path-based overload's behavior when a PNG can't be read.
         /// </summary>
+        /// <exception cref="InvalidOperationException"><see cref="IsNativeTsxProject"/> is true --
+        /// see <see cref="SaveAnimationChainList(string)"/>'s matching exception doc.</exception>
         public void SaveAnimationChainList(Stream stream)
         {
+            ThrowIfNativeTsxProject();
+
             var acls = AnimationChainListSave;
             if (acls == null) return;
 
@@ -206,8 +292,12 @@ namespace AnimationEditor.Core
         /// <see cref="AnimationChainListSave.Save(Stream)"/> would otherwise trigger from inside
         /// <c>XmlWriter.Dispose()</c>. See <see cref="AnimationChainListSave.SaveAsync"/>.
         /// </summary>
+        /// <exception cref="InvalidOperationException"><see cref="IsNativeTsxProject"/> is true --
+        /// see <see cref="SaveAnimationChainList(string)"/>'s matching exception doc.</exception>
         public async Task SaveAnimationChainListAsync(Stream stream)
         {
+            ThrowIfNativeTsxProject();
+
             var acls = AnimationChainListSave;
             if (acls == null) return;
 
@@ -629,19 +719,52 @@ namespace AnimationEditor.Core
         /// </summary>
         /// <exception cref="NotSupportedException">The tsx uses a construct (wangsets,
         /// transformations, per-tile object layers, unsupported property types) that would be lost
-        /// on the first save -- see <see cref="Tiled.TsxCompatibilityChecker"/>. The project is left
-        /// unchanged when this is thrown.</exception>
+        /// on the first save -- see <see cref="Tiled.TsxCompatibilityChecker"/>.</exception>
+        /// <exception cref="InvalidOperationException">The tsx is corrupt in a way <see
+        /// cref="Tiled.TiledAnimationToAchjMapper.Map"/> can't tolerate (e.g. <c>Columns &lt;= 0</c>
+        /// or a duplicate tile id) -- or some achx/achj already has a <c>.tiledsync</c> association
+        /// (see <see cref="IO.IoManager.AddAssociatedTiledTilesetPath"/>) pointing achx-push at this
+        /// same tsx (issue #1147): a tsx can't be both a native-tsx project and an achx-push target
+        /// at the same time, since the two features' save paths would silently fight over the same
+        /// file.</exception>
+        /// <remarks>The project is left unchanged when either exception is thrown -- <see
+        /// cref="AnimationChainListSave"/> is mapped into local variables first and only committed
+        /// to this instance's fields after every step that can throw has already succeeded, so a
+        /// rejected load can never leave <see cref="IsNativeTsxProject"/> pointing at a tileset with
+        /// no matching chain data.</remarks>
         public void LoadTsxProject(FilePath fileName)
         {
+            var conflictingOwners = Tiled.TiledSyncAssociationScanner.FindAssociationsTargeting(fileName.FullPath);
+            if (conflictingOwners.Count > 0)
+                throw new InvalidOperationException(
+                    $"Cannot open \"{fileName.FullPath}\" as a native AnimationEditor project -- " +
+                    $"it is already associated as a Tiled sync target from \"{conflictingOwners[0]}\" " +
+                    "(Associate Tiled Tileset). A .tsx cannot be both a native-tsx project and an " +
+                    "achx-push target at the same time.");
+
             var tileset = DotTiled.Serialization.Loader.Default().LoadTileset(fileName.FullPath);
 
             if (!Tiled.TsxCompatibilityChecker.CheckOpenCompatibility(tileset, out var blockingReason))
                 throw new NotSupportedException(
                     $"Can't open \"{fileName.FullPath}\" as a native AnimationEditor project: {blockingReason}");
 
+            var acls = Tiled.TiledAnimationToAchjMapper.Map(tileset, out var entryTileIdsByChain, out var satelliteTileIdsByChain);
+
             _tsxTileset = tileset;
-            AnimationChainListSave = Tiled.TiledAnimationToAchjMapper.Map(tileset);
+            AnimationChainListSave = acls;
+            _tsxEntryTileIdsByChain = new Dictionary<AnimationChainSave, uint>(entryTileIdsByChain, ReferenceEqualityComparer.Instance);
+            _tsxSatelliteTileIdsByChain = new Dictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>>(satelliteTileIdsByChain, ReferenceEqualityComparer.Instance);
             FileName = fileName.FullPath;
+
+            // Seeds _tsxLastNonEmptyFramesByChain from what was just loaded, so a chain whose
+            // frames are cleared on the very first save after load (no intervening save to have
+            // captured this otherwise) can still go dormant instead of losing its hint outright --
+            // see _tsxDormantHintsByChain's doc comment.
+            _tsxLastNonEmptyFramesByChain = new Dictionary<AnimationChainSave, IReadOnlyList<AnimationFrameSave>>(ReferenceEqualityComparer.Instance);
+            foreach (var chain in acls.AnimationChains)
+                if (chain.Frames.Count > 0)
+                    _tsxLastNonEmptyFramesByChain[chain] = chain.Frames.ToArray();
+            _tsxDormantHintsByChain = new Dictionary<AnimationChainSave, DormantTsxHint>(ReferenceEqualityComparer.Instance);
         }
 
         /// <summary>
@@ -649,26 +772,290 @@ namespace AnimationEditor.Core
         /// cref="LoadTsxProject"/>, via <see cref="Tiled.MultiTileToTiledAnimationMapper"/> and <see
         /// cref="Tiled.NativeTsxAnimationSync"/>. No-op if no tsx project is loaded.
         /// </summary>
+        /// <remarks>Same all-or-nothing invariant as <see cref="LoadTsxProject"/>: <see
+        /// cref="Tiled.NativeTsxAnimationSync.Apply"/> runs against a working copy (<see
+        /// cref="Tiled.NativeTsxAnimationSync.CloneForSave"/>), and this instance only adopts it
+        /// after <see cref="Tiled.TsxWriter.Write(DotTiled.Tileset, string)"/> has actually
+        /// succeeded -- so a write failure (an unsupported construct, a disk/permissions error)
+        /// can't leave the in-memory tileset reflecting computed-but-never-persisted state.</remarks>
         public void SaveTsxProject(string? targetPath = null)
         {
             if (_tsxTileset == null || AnimationChainListSave == null)
                 return;
 
-            var mapped = Tiled.MultiTileToTiledAnimationMapper.Map(AnimationChainListSave, BuildTsxTilesetInfo(_tsxTileset));
-            Tiled.NativeTsxAnimationSync.Apply(_tsxTileset, mapped);
-            Tiled.TsxWriter.Write(_tsxTileset, targetPath ?? FileName!);
+            // Revives a dormant hint for this save's Map() call, but only for a chain whose
+            // current Frames are reference-sequence-identical to the ones captured when that hint
+            // went dormant -- i.e. DeleteFramesCommand.Undo() re-inserting the exact same frame
+            // objects it just removed. A chain re-authored with different frame content (even the
+            // same count) does not match and is left to recompute fresh, same as today.
+            var entryHintsForMap = _tsxEntryTileIdsByChain;
+            var satelliteHintsForMap = _tsxSatelliteTileIdsByChain;
+            if (_tsxDormantHintsByChain.Count > 0)
+            {
+                foreach (var chain in AnimationChainListSave.AnimationChains)
+                {
+                    if (chain.Frames.Count == 0) continue;
+                    if (!_tsxDormantHintsByChain.TryGetValue(chain, out var dormant)) continue;
+                    if (!FramesSequenceEqual(dormant.Frames, chain.Frames)) continue;
+
+                    if (ReferenceEquals(entryHintsForMap, _tsxEntryTileIdsByChain))
+                        entryHintsForMap = new Dictionary<AnimationChainSave, uint>(_tsxEntryTileIdsByChain, ReferenceEqualityComparer.Instance);
+                    entryHintsForMap[chain] = dormant.EntryTileId;
+
+                    if (dormant.Satellites.Count > 0)
+                    {
+                        if (ReferenceEquals(satelliteHintsForMap, _tsxSatelliteTileIdsByChain))
+                            satelliteHintsForMap = new Dictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>>(_tsxSatelliteTileIdsByChain, ReferenceEqualityComparer.Instance);
+                        satelliteHintsForMap[chain] = dormant.Satellites;
+                    }
+                }
+            }
+
+            var mapped = Tiled.MultiTileToTiledAnimationMapper.Map(
+                AnimationChainListSave, BuildTsxTilesetInfo(_tsxTileset), entryHintsForMap, satelliteHintsForMap);
+            var workingTileset = Tiled.NativeTsxAnimationSync.CloneForSave(_tsxTileset);
+            Tiled.NativeTsxAnimationSync.Apply(workingTileset, mapped);
+            Tiled.TsxWriter.Write(workingTileset, targetPath ?? FileName!);
+            _tsxTileset = workingTileset;
+
+            // Commits this save's tile assignments (including a brand-new chain's freshly-chosen
+            // id) so the *next* save reuses them instead of recomputing from geometry again -- see
+            // _tsxEntryTileIdsByChain's doc comment for why that matters. Rebuilt primarily from
+            // `mapped` (rather than just adding to it) so a chain that's still in the project but
+            // now has zero frames doesn't leave a stale hint a later re-populated save could wrongly
+            // reuse (see SaveTsxProject_AllFramesDeletedFromChain_... below).
+            //
+            // Hints for chains that are entirely ABSENT from AnimationChainListSave right now
+            // (never reached `mapped` at all) are carried forward unchanged rather than dropped.
+            // A Delete-chain command autosaves immediately after removing the chain, and its Undo
+            // re-inserts the exact same AnimationChainSave object and autosaves again -- carrying
+            // the hint forward is what lets that reinsertion land back on the chain's original
+            // tile instead of being recomputed from frame[0] as if it were brand new. This can't
+            // reintroduce the zero-frame-chain hazard above: that hazard is about a chain staying
+            // present while its EntryTileId goes null, which this branch never touches.
+            var currentChains = new HashSet<AnimationChainSave>(
+                AnimationChainListSave.AnimationChains, ReferenceEqualityComparer.Instance);
+
+            var updatedEntries = new Dictionary<AnimationChainSave, uint>(ReferenceEqualityComparer.Instance);
+            foreach (var kvp in _tsxEntryTileIdsByChain)
+                if (!currentChains.Contains(kvp.Key))
+                    updatedEntries[kvp.Key] = kvp.Value;
+
+            var updatedSatellites = new Dictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>>(ReferenceEqualityComparer.Instance);
+            foreach (var kvp in _tsxSatelliteTileIdsByChain)
+                if (!currentChains.Contains(kvp.Key))
+                    updatedSatellites[kvp.Key] = kvp.Value;
+
+            var updatedLastFrames = new Dictionary<AnimationChainSave, IReadOnlyList<AnimationFrameSave>>(ReferenceEqualityComparer.Instance);
+            foreach (var kvp in _tsxLastNonEmptyFramesByChain)
+                if (!currentChains.Contains(kvp.Key))
+                    updatedLastFrames[kvp.Key] = kvp.Value;
+
+            // Dormant hints for an absent chain are carried forward unchanged, same reasoning as
+            // the dictionaries above -- DeleteChainsCommand's own absent-chain carry-forward
+            // already handles reinsertion of the chain itself; this only matters if a chain is
+            // deleted while it already had a dormant (frames-cleared) hint pending.
+            var updatedDormant = new Dictionary<AnimationChainSave, DormantTsxHint>(ReferenceEqualityComparer.Instance);
+            foreach (var kvp in _tsxDormantHintsByChain)
+                if (!currentChains.Contains(kvp.Key))
+                    updatedDormant[kvp.Key] = kvp.Value;
+
+            foreach (var result in mapped)
+            {
+                var chain = result.SourceChain;
+                if (result.EntryTileId is { } entryTileId)
+                {
+                    // A live hint again this save (freshly computed, or a dormant one just
+                    // revived above) -- not dormant, and remembers these frames as the sequence
+                    // that produced it.
+                    updatedEntries[chain] = entryTileId;
+                    updatedLastFrames[chain] = chain.Frames.ToArray();
+
+                    if (result.Satellites.Count > 0)
+                    {
+                        // Merged onto whatever this chain's satellite hints already were (rather
+                        // than replacing the whole per-chain dictionary), so an offset that isn't
+                        // part of *this* save's footprint keeps whatever hint it had -- see the
+                        // branch below for why that matters.
+                        var merged = _tsxSatelliteTileIdsByChain.TryGetValue(chain, out var existingSatellites)
+                            ? new Dictionary<(int Dx, int Dy), uint>(existingSatellites)
+                            : new Dictionary<(int Dx, int Dy), uint>();
+                        foreach (var satellite in result.Satellites)
+                            merged[satellite.Offset] = satellite.TileId;
+                        updatedSatellites[chain] = merged;
+                    }
+                    else if (_tsxSatelliteTileIdsByChain.TryGetValue(chain, out var stillHinted))
+                    {
+                        // This save's footprint has no satellites at all -- e.g. a resize command
+                        // shrank every frame down to a single tile. chain.Frames never went to zero
+                        // and no AnimationFrameSave object was added or removed (a resize only
+                        // mutates existing frames' Left/Top/Right/BottomCoordinate in place), so
+                        // there's no frame-reference signal available to gate a dormant-hint-style
+                        // revival on. Keeping the old per-offset hints alive unconditionally instead
+                        // mirrors how _tsxEntryTileIdsByChain already behaves for a chain that never
+                        // empties: once a (chain, offset) pair claims a tile, later saves keep
+                        // reusing it for as long as the chain has any frames at all, so a save right
+                        // after Undo restores the satellite to its original tile instead of
+                        // recomputing it from geometry.
+                        updatedSatellites[chain] = stillHinted;
+                    }
+                }
+                else if (chain.Frames.Count == 0)
+                {
+                    // Genuinely empty this save. Prefer an already-dormant hint (so a chain left
+                    // empty across several consecutive saves keeps the same dormant hint/
+                    // fingerprint instead of losing it after the first "still empty" resave),
+                    // falling back to freshly demoting whatever was active just before this save
+                    // -- the very first "cleared" save after a real hint existed. A chain with no
+                    // prior hint at all (e.g. a brand-new chain deleted before its first save) has
+                    // nothing to preserve, so no dormant entry is created.
+                    if (_tsxDormantHintsByChain.TryGetValue(chain, out var stillDormant))
+                        updatedDormant[chain] = stillDormant;
+                    else if (_tsxEntryTileIdsByChain.TryGetValue(chain, out var oldEntry)
+                        && _tsxLastNonEmptyFramesByChain.TryGetValue(chain, out var oldFrames))
+                    {
+                        _tsxSatelliteTileIdsByChain.TryGetValue(chain, out var oldSatellites);
+                        updatedDormant[chain] = new DormantTsxHint(
+                            oldEntry, oldSatellites ?? new Dictionary<(int Dx, int Dy), uint>(), oldFrames);
+                    }
+                }
+                else if (_tsxEntryTileIdsByChain.TryGetValue(chain, out var stillActiveEntry))
+                {
+                    // The chain still has frames, but this save's mapping aborted with a warning
+                    // (a mismatched texture name, a misaligned/negative-origin rect, a footprint
+                    // that overflows the tileset, non-zero margin/spacing, etc.) rather than the
+                    // chain being genuinely cleared above. Without this branch, a command whose
+                    // Do() introduces one of these warnings and whose Undo() fixes it again (e.g.
+                    // SetFrameTextureNameCommand pointing a frame at the wrong texture, then back)
+                    // would silently drop the chain's entry/satellite hints on the Do() save --
+                    // neither the "live hint" branch above nor the "genuinely empty" branch here
+                    // applies -- so the very next successful save (the Undo()) would recompute the
+                    // entry tile fresh from frame[0], relocating an "owner isn't its own first
+                    // frame" hand-authored chain exactly like the already-fixed bugs this whole file
+                    // is themed around. Keeping the existing hints untouched here mirrors the
+                    // "chain absent from the ACLS" carry-forward above -- a transient, recoverable
+                    // save state, not a real identity change.
+                    updatedEntries[chain] = stillActiveEntry;
+                    if (_tsxLastNonEmptyFramesByChain.TryGetValue(chain, out var stillActiveFrames))
+                        updatedLastFrames[chain] = stillActiveFrames;
+                    if (_tsxSatelliteTileIdsByChain.TryGetValue(chain, out var stillActiveSatellites))
+                        updatedSatellites[chain] = stillActiveSatellites;
+                }
+                else if (_tsxDormantHintsByChain.TryGetValue(chain, out var stillDormantThroughAbort))
+                {
+                    // The dormant sibling of the branch above: this chain was DORMANT (not live)
+                    // before this save, and its refill this save was neither a reference-match
+                    // revival (handled by the pre-map injection above) nor a genuine re-emptying
+                    // (Frames.Count > 0 here) -- it was refilled with new content that itself hit
+                    // a mapping abort (mismatched texture, misaligned rect, etc.). Without this
+                    // branch the dormant hint is simply dropped, even though a later save could
+                    // still legitimately revive it (e.g. the abort gets fixed, or the refill is
+                    // undone back to the exact original frame objects). Keep it parked exactly as
+                    // it was, same "transient, recoverable save state" treatment as the live case.
+                    updatedDormant[chain] = stillDormantThroughAbort;
+                }
+            }
+            _tsxEntryTileIdsByChain = updatedEntries;
+            _tsxSatelliteTileIdsByChain = updatedSatellites;
+            _tsxLastNonEmptyFramesByChain = updatedLastFrames;
+            _tsxDormantHintsByChain = updatedDormant;
+        }
+
+        /// <summary>Whether <paramref name="a"/> and <paramref name="b"/> hold the exact same
+        /// <see cref="AnimationFrameSave"/> objects, in the same order -- the "is this the same
+        /// Undo?" test <see cref="_tsxDormantHintsByChain"/> relies on. Deliberately reference
+        /// equality, not value equality: a genuinely re-authored frame with identical-looking
+        /// coordinates is still a different object and must NOT match.</summary>
+        private static bool FramesSequenceEqual(IReadOnlyList<AnimationFrameSave> a, IReadOnlyList<AnimationFrameSave> b)
+        {
+            if (a.Count != b.Count) return false;
+            for (var i = 0; i < a.Count; i++)
+                if (!ReferenceEquals(a[i], b[i])) return false;
+            return true;
+        }
+
+        /// <summary>Opaque snapshot type returned by <see cref="CaptureTsxState"/> -- holds
+        /// direct references to this instance's tsx-specific fields at capture time, safe to
+        /// share without cloning because <see cref="LoadTsxProject"/>/<see cref="SaveTsxProject"/>
+        /// always replace these fields wholesale rather than mutating them in place.</summary>
+        private sealed record TsxState(
+            DotTiled.Tileset Tileset,
+            Dictionary<AnimationChainSave, uint> EntryTileIdsByChain,
+            Dictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>> SatelliteTileIdsByChain,
+            Dictionary<AnimationChainSave, IReadOnlyList<AnimationFrameSave>> LastNonEmptyFramesByChain,
+            Dictionary<AnimationChainSave, DormantTsxHint> DormantHintsByChain);
+
+        /// <inheritdoc/>
+        public object? CaptureTsxState() =>
+            _tsxTileset is null ? null : new TsxState(
+                _tsxTileset, _tsxEntryTileIdsByChain, _tsxSatelliteTileIdsByChain,
+                _tsxLastNonEmptyFramesByChain, _tsxDormantHintsByChain);
+
+        /// <inheritdoc/>
+        public void RestoreTsxState(object? state)
+        {
+            if (state is TsxState tsxState)
+            {
+                _tsxTileset = tsxState.Tileset;
+                _tsxEntryTileIdsByChain = tsxState.EntryTileIdsByChain;
+                _tsxSatelliteTileIdsByChain = tsxState.SatelliteTileIdsByChain;
+                _tsxLastNonEmptyFramesByChain = tsxState.LastNonEmptyFramesByChain;
+                _tsxDormantHintsByChain = tsxState.DormantHintsByChain;
+            }
+            else
+            {
+                _tsxTileset = null;
+                _tsxEntryTileIdsByChain = new Dictionary<AnimationChainSave, uint>(ReferenceEqualityComparer.Instance);
+                _tsxSatelliteTileIdsByChain = new Dictionary<AnimationChainSave, IReadOnlyDictionary<(int Dx, int Dy), uint>>(ReferenceEqualityComparer.Instance);
+                _tsxLastNonEmptyFramesByChain = new Dictionary<AnimationChainSave, IReadOnlyList<AnimationFrameSave>>(ReferenceEqualityComparer.Instance);
+                _tsxDormantHintsByChain = new Dictionary<AnimationChainSave, DormantTsxHint>(ReferenceEqualityComparer.Instance);
+            }
+        }
+
+        /// <inheritdoc/>
+        public object? CaptureTextureSizeState() => _knownTextureSizes;
+
+        /// <inheritdoc/>
+        public void RestoreTextureSizeState(object? state) =>
+            _knownTextureSizes = state as IReadOnlyDictionary<string, (int Width, int Height)>;
+
+        /// <inheritdoc/>
+        public void ResetToBlankDocument()
+        {
+            AnimationChainListSave = new AnimationChainListSave();
+            FileName = null;
+            OnDiskCoordinateType = TextureCoordinateType.Pixel;
+            RestoreTsxState(null);
+            RestoreTextureSizeState(null);
+            ReferencedPngs = new FilePath[0];
         }
 
         /// <summary>
         /// Names of chains that have a <see cref="Tiled.TsxAnimationValidator"/> issue -- a
         /// multi-tile group whose satellite tile has drifted out of lockstep with its anchor, or a
-        /// dangling <c>ParentId</c> (issue #1140). Empty when no tsx project is loaded or nothing
-        /// is wrong. Correlates the validator's tile-id-keyed issues back to chain names by
-        /// re-running <see cref="Tiled.MultiTileToTiledAnimationMapper"/> on the current in-memory
-        /// chains and matching each chain's own computed entry tile id against an issue's anchor id
-        /// -- the same id math <see cref="SaveTsxProject"/> uses, so this always reflects the
-        /// chains as they'd actually be written, not just as they were on load.
+        /// dangling/chained/backward/incomplete-footprint <c>ParentId</c> (issue #1140). Empty when
+        /// no tsx project is loaded or nothing is wrong. Correlates the validator's tile-id-keyed
+        /// issues back to chain names by re-running <see cref="Tiled.MultiTileToTiledAnimationMapper"/>
+        /// on the current in-memory chains and matching each chain's own computed entry tile id
+        /// against either an issue's <c>AnchorTileId</c> or its <c>TileId</c> -- the same id math
+        /// <see cref="SaveTsxProject"/> uses, so this always reflects the chains as they'd actually
+        /// be written, not just as they were on load.
         /// </summary>
+        /// <remarks>
+        /// Matching only <c>AnchorTileId</c> is correct for a lockstep-mismatch issue (the satellite
+        /// itself is folded into its anchor's chain, never its own) but wrong for a broken-ParentId
+        /// issue (dangling/chained/backward/incomplete-footprint): <see
+        /// cref="Tiled.TiledAnimationToAchjMapper.Map"/> makes the *referencing* tile (<c>TileId</c>)
+        /// its own independent chain in those cases, not a satellite of <c>AnchorTileId</c>'s chain --
+        /// matching only <c>AnchorTileId</c> either misses the actually-broken chain entirely (a
+        /// chained ParentId, where the immediate parent is itself just a normal folded-in satellite
+        /// with no chain of its own) or flags an unrelated, perfectly consistent chain instead (a
+        /// backward ParentId, when the tile it names happens to be a real anchor with its own
+        /// chain). Matching either id catches the actually-broken chain in every case, at the cost of
+        /// also (correctly, not just incidentally) flagging the referenced anchor's chain too when it
+        /// happens to have one -- reasonable, since one of its would-be satellites failing to attach
+        /// is worth surfacing on the anchor as well.
+        /// </remarks>
         public IReadOnlyList<string> GetChainNamesWithTsxIssues()
         {
             if (_tsxTileset == null || AnimationChainListSave == null)
@@ -678,10 +1065,11 @@ namespace AnimationEditor.Core
             if (issues.Count == 0)
                 return Array.Empty<string>();
 
-            var anchorTileIdsWithIssues = issues.Select(i => i.AnchorTileId).ToHashSet();
+            var flaggedTileIds = issues.SelectMany(i => new[] { i.AnchorTileId, i.TileId }).ToHashSet();
 
-            return Tiled.MultiTileToTiledAnimationMapper.Map(AnimationChainListSave, BuildTsxTilesetInfo(_tsxTileset))
-                .Where(r => r.EntryTileId.HasValue && anchorTileIdsWithIssues.Contains(r.EntryTileId.Value))
+            return Tiled.MultiTileToTiledAnimationMapper.Map(
+                    AnimationChainListSave, BuildTsxTilesetInfo(_tsxTileset), _tsxEntryTileIdsByChain, _tsxSatelliteTileIdsByChain)
+                .Where(r => r.EntryTileId.HasValue && flaggedTileIds.Contains(r.EntryTileId.Value))
                 .Select(r => r.ChainName)
                 .ToList();
         }
@@ -703,6 +1091,7 @@ namespace AnimationEditor.Core
                 TileWidth = tileset.TileWidth,
                 TileHeight = tileset.TileHeight,
                 ColumnCount = tileset.Columns,
+                TileCount = tileset.TileCount,
                 ImageFileName = image.HasValue && image.Value.Source.HasValue ? image.Value.Source.Value : string.Empty,
                 TextureWidth = image.HasValue && image.Value.Width.HasValue ? image.Value.Width.Value : null,
                 TextureHeight = image.HasValue && image.Value.Height.HasValue ? image.Value.Height.Value : null,

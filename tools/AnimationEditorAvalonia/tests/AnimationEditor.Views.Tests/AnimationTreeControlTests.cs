@@ -30,7 +30,7 @@ public class AnimationTreeControlTests
     {
         public AnimationChainListSave? AnimationChainListSave { get; set; }
         public TileMapInformationList TileMapInformationList { get; set; } = new();
-        public FilePath[] ReferencedPngs => Array.Empty<FilePath>();
+        public FilePath[] ReferencedPngs { get; set; } = Array.Empty<FilePath>();
         public string? FileName { get; set; }
         public string? ProjectFolderPath { get; set; }
         public TextureCoordinateType OnDiskCoordinateType { get; set; }
@@ -39,6 +39,11 @@ public class AnimationTreeControlTests
         public void LoadTsxProject(FilePath fileName) { }
         public void SaveTsxProject(string? targetPath = null) { }
         public IReadOnlyList<string> GetChainNamesWithTsxIssues() => Array.Empty<string>();
+        public object? CaptureTsxState() => null;
+        public void RestoreTsxState(object? state) { }
+        public object? CaptureTextureSizeState() => null;
+        public void RestoreTextureSizeState(object? state) { }
+        public void ResetToBlankDocument() { }
 
         public void LoadAnimationChain(
             FilePath fileName,

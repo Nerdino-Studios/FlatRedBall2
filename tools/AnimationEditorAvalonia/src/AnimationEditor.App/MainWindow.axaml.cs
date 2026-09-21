@@ -777,10 +777,13 @@ public partial class MainWindow : Window
 
     private void ActivateUntitledTabContent(TabEntry tab)
     {
+        // ResetToBlankDocument (#1147) clears any native-tsx/texture-size/ReferencedPngs state
+        // the previously-active tab left behind -- an untitled tab is never a tsx project, so
+        // switching to one must not keep reporting IsNativeTsxProject true.
+        _projectManager.ResetToBlankDocument();
         // See the comment in ActivateTabAsync (#1026) -- a pending cut survives this switch too.
-        _projectManager.AnimationChainListSave =
-            tab.CachedEditorModel ?? new AnimationChainListSave();
-        _projectManager.FileName = null;
+        if (tab.CachedEditorModel is not null)
+            _projectManager.AnimationChainListSave = tab.CachedEditorModel;
         _appCommands.RestoreTabSelection(tab);
         _undoManager.Clear();
         if (tab.UndoSnapshot != null)
@@ -906,10 +909,10 @@ public partial class MainWindow : Window
         }
         else
         {
-            // All tabs closed — start fresh
+            // All tabs closed — start fresh. ResetToBlankDocument (#1147) also clears any
+            // native-tsx/texture-size/ReferencedPngs state the just-closed tab left behind.
             ShowAchxPane();
-            _projectManager.AnimationChainListSave = new AnimationChainListSave();
-            _projectManager.FileName = null;
+            _projectManager.ResetToBlankDocument();
             _selectedState.Reset();
             _undoManager.Clear();
             ProjectPanel.SyncSelectionToActiveFile(null);
@@ -1005,8 +1008,7 @@ public partial class MainWindow : Window
         }
         else if (recovered is null)
         {
-            _projectManager.AnimationChainListSave =
-                new AnimationChainListSave();
+            _projectManager.AnimationChainListSave = new AnimationChainListSave();
         }
 
         if (recovered is not null)
@@ -1161,6 +1163,19 @@ public partial class MainWindow : Window
         _appCommands.FileDialogService = new Services.AvaloniaFileDialogService(this);
         _appCommands.LoadFailed += (path, ex) =>
             Dispatcher.UIThread.InvokeAsync(() => ShowLoadFailedDialogAsync(path, ex));
+
+        // Tab-awareness for the native-tsx/achx-push coexistence guard (issue #1147):
+        // AddAssociatedTiledTileset needs to know whether the target .tsx is open as a native-tsx
+        // project in some OTHER tab, which AppCommands/ProjectManager alone can't see -- ProjectManager
+        // only knows its own current (active) project, not the full set of tabs _tabManager owns.
+        _appCommands.IsTsxPathOpenAsNativeProject = tsxPath =>
+        {
+            var target = new FilePath(tsxPath);
+            if (_projectManager.IsNativeTsxProject && _projectManager.FileName != null &&
+                new FilePath(_projectManager.FileName) == target)
+                return true;
+            return _tabManager.Tabs.Any(t => t.Path == target && t.CachedTsxState != null);
+        };
 
         _appCommands.HotReloadFailed += (path, reason) =>
             Dispatcher.UIThread.InvokeAsync(() =>
@@ -2516,13 +2531,21 @@ public partial class MainWindow : Window
     /// </summary>
     private void OpenAsNewUnsavedDocument(AnimationChainListSave content, AnimationChainSave? selectedChain = null)
     {
+        // ResetToBlankDocument (#1147) clears any native-tsx/texture-size/ReferencedPngs state
+        // the previously-active tab left behind before content replaces the fresh blank ACLS.
+        _projectManager.ResetToBlankDocument();
         _projectManager.AnimationChainListSave = content;
-        _projectManager.FileName = null;
         _selectedState.Reset();
         if (selectedChain is not null)
             _selectedState.SelectedChain = selectedChain;
         _undoManager.Clear();
         RefreshTreeView();
+        // ResetToBlankDocument above doesn't raise CurrentFileChanged (it's a plain field
+        // reset, not a load), so the title bar needs an explicit refresh here -- otherwise it
+        // keeps showing whatever file was open before (#1147: reachable via File > New when the
+        // follow-up Save As dialog is cancelled, since that's the only other path that would
+        // have updated it).
+        UpdateTitle();
 
         // Open a new numbered Untitled tab and activate it.
         var displayName = TabManager.ComputeUntitledDisplayName(
@@ -4043,13 +4066,15 @@ public partial class MainWindow : Window
 
     private async void OnWindowDrop(object? sender, DragEventArgs e)
     {
-        var achxFiles = AchxDropProcessor.SelectAchxFiles(DroppedFilePaths(e));
-        if (achxFiles.Count == 0) return;  // not ours — leave the tree's PNG drop to run
+        // Includes native-tsx (#1140) paths alongside achx/achj (#1147) -- LoadAnimationFileAsync
+        // dispatches either kind to the correct workflow via OpenProjectWorkflowAsync.
+        var projectFiles = AchxDropProcessor.SelectAchxFiles(DroppedFilePaths(e));
+        if (projectFiles.Count == 0) return;  // not ours — leave the tree's PNG drop to run
 
         e.Handled = true;
         // LoadAnimationFileAsync de-dupes against already-open tabs (focuses instead of
         // duplicating); awaiting in sequence opens each file and leaves the last active.
-        foreach (var path in achxFiles)
+        foreach (var path in projectFiles)
             await LoadAnimationFileAsync(path);
     }
 

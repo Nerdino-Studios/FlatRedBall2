@@ -13,6 +13,7 @@ public class MultiTileToTiledAnimationMapperTests
         TileWidth = 16,
         TileHeight = 16,
         ColumnCount = 4,
+        TileCount = 16,
         ImageFileName = "Heroes.png",
     };
 
@@ -69,6 +70,50 @@ public class MultiTileToTiledAnimationMapperTests
         // Satellite's own identity tile is frame 0's right-hand cell: column 1, row 0 -> tile id 1.
         Assert.Equal((uint)1, satellite.TileId);
         Assert.Equal([new MappedFrame(1, 100), new MappedFrame(2, 100)], satellite.Frames);
+    }
+
+    [Fact]
+    public void Map_NegativeAlignedFrameOrigin_SkipsChainAndWarnsInsteadOfUncheckedCastToHugeTileId()
+    {
+        // Left=-16 is an exact multiple of tile width 16 (remainder 0), so it isn't caught by the
+        // grid-alignment check, but resolves to column -1 -- an unchecked cast to uint would wrap
+        // to 4294967295 for the anchor tile id.
+        var achj = AchjWithChain("Corrupt", PixelFrame(-16, 0, 0, 16));
+
+        var results = MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo);
+
+        Assert.Empty(results[0].AnchorFrames);
+        Assert.Contains("negative", results[0].Warnings[0]);
+    }
+
+    [Fact]
+    public void Map_FrameFootprintExtendsPastTilesetRightEdge_SkipsChainAndWarnsInsteadOfWrappingIntoNextRow()
+    {
+        // Columns=4, footprint is 2 tiles wide, anchored at column 3 (the last column) -- the
+        // footprint's right-hand cell would need column 4, which doesn't exist in this row.
+        // originColumn(3) + dx(1) = 4 == ColumnCount computes a tileId that lands on a real tile
+        // (the first tile of the next row) instead of failing, silently misplacing the satellite.
+        var achj = AchjWithChain("BadEdge", PixelFrame(48, 0, 80, 16));
+
+        var results = MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo);
+
+        Assert.Empty(results[0].AnchorFrames);
+        Assert.Contains("column", results[0].Warnings[0]);
+    }
+
+    [Fact]
+    public void Map_FootprintBottomRowBeyondTilesetTileCount_SkipsChainAndWarnsInsteadOfFabricatingOutOfRangeTile()
+    {
+        // 1-wide x 2-tall footprint anchored at row 3, column 0 (TileCount=16 -> valid rows are
+        // 0-3, ids 0-15). The origin cell (row 3, id 12) is in range, but the footprint's bottom
+        // cell is row 4 -> id 4*4+0 = 16, at/past TileCount. Column bound alone can't catch this --
+        // it only checks originColumn+footprintColumns against ColumnCount, never the row axis.
+        var achj = AchjWithChain("BadBottomEdge", PixelFrame(0, 48, 16, 80));
+
+        var results = MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo);
+
+        Assert.Empty(results[0].AnchorFrames);
+        Assert.Contains("tile(s)", results[0].Warnings[0]);
     }
 
     [Fact]

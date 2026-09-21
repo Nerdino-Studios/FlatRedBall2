@@ -14,6 +14,7 @@ public class AchjToTiledAnimationMapperTests
         TileWidth = 16,
         TileHeight = 32,
         ColumnCount = 4,
+        TileCount = 16,
         ImageFileName = "AnimatedSpritesheet.png",
     };
 
@@ -44,6 +45,36 @@ public class AchjToTiledAnimationMapperTests
     };
 
     [Fact]
+    public void Map_ColumnBeyondTilesetWidth_SkipsFrameAndWarnsInsteadOfWrappingIntoNextRow()
+    {
+        // Left=64 is column 4 -- one past the last valid column index (0-3) in a 4-column
+        // tileset. Column 4 passes both the grid-alignment and negative-column checks, but
+        // tileId = row*ColumnCount + column would land on tile 4 -- a real tile, just the first
+        // one of the *next* row, not "one past the last column of this row".
+        var achj = AchjWithChain("Corrupt", PixelFrame(64, 0, 80, 32));
+
+        var results = AchjToTiledAnimationMapper.Map(achj, TilesetInfo);
+
+        Assert.Empty(results[0].Frames);
+        Assert.Contains("column", results[0].Warnings[0]);
+    }
+
+    [Fact]
+    public void Map_RowBeyondTilesetTileCount_SkipsFrameAndWarnsInsteadOfFabricatingOutOfRangeTile()
+    {
+        // Row 4 (top=128, tile height 32), column 0 -- column 0 is in range, but tileId = 4*4+0 =
+        // 16, which is at/past this tileset's declared TileCount (16, tile ids 0-15). Unlike
+        // column overflow, this doesn't wrap into an existing tile -- it's a tile id with no real
+        // cell at all, which the sync step would otherwise fabricate a phantom <tile> for.
+        var achj = AchjWithChain("Corrupt", PixelFrame(0, 128, 16, 160));
+
+        var results = AchjToTiledAnimationMapper.Map(achj, TilesetInfo);
+
+        Assert.Empty(results[0].Frames);
+        Assert.Contains("tile id 16", results[0].Warnings[0]);
+    }
+
+    [Fact]
     public void Map_DifferentTexture_SkipsFrameAndWarns()
     {
         var achj = AchjWithChain("OtherTexture", PixelFrame(0, 0, 16, 32, textureName: "OtherSheet.png"));
@@ -52,6 +83,28 @@ public class AchjToTiledAnimationMapperTests
 
         Assert.Empty(results[0].Frames);
         Assert.Contains("different texture", results[0].Warnings[0]);
+    }
+
+    [Fact]
+    public void Map_FirstFrameSkippedButLaterFrameValid_EntryTileIdIsFirstSurvivingFrameNotOriginalFrameZero()
+    {
+        // EntryTileId is documented (see ChainMappingResult.EntryTileId) as "the first non-skipped
+        // frame's tile id," not "frame 0's tile id" -- and that's intentional here, not a gap:
+        // achx-push has no identity-preservation concept for entry tile ids the way native-tsx's
+        // knownEntryTileIds hint does (TilesetAnimationSync's own
+        // Apply_RenamedChainMovesToDifferentTile_ClearsOldTileAndPopulatesNewTile test already
+        // establishes that an achx-push chain simply follows wherever its geometry currently
+        // points, with the sync layer's source-scoped stale-clearing self-healing the old tile
+        // either way). This chain's frame 0 references a different texture (skipped); frame 1 is
+        // the first frame that actually survives, at tile 5.
+        var achj = AchjWithChain("Walk",
+            PixelFrame(0, 0, 16, 32, textureName: "OtherSheet.png"),
+            PixelFrame(16, 32, 32, 64));
+
+        var results = AchjToTiledAnimationMapper.Map(achj, TilesetInfo);
+
+        Assert.Equal((uint)5, results[0].EntryTileId);
+        Assert.Equal([(uint)5], results[0].Frames.Select(f => f.TileId));
     }
 
     [Fact]
@@ -104,6 +157,21 @@ public class AchjToTiledAnimationMapperTests
     }
 
     [Fact]
+    public void Map_NegativeAlignedCoordinate_SkipsFrameAndWarnsInsteadOfUncheckedCastToHugeId()
+    {
+        // Left=-16 is an exact multiple of tile width 16, so it passes the grid-alignment check
+        // (remainder is 0 -- C#'s "%" keeps the dividend's sign) yet resolves to column -1.
+        // Casting that straight to uint would wrap to 4294967295, same bug shape as the
+        // negative-ParentId fix in TiledAnimationToAchjMapper.
+        var achj = AchjWithChain("Corrupt", PixelFrame(-16, 0, 0, 32));
+
+        var results = AchjToTiledAnimationMapper.Map(achj, TilesetInfo);
+
+        Assert.Empty(results[0].Frames);
+        Assert.Contains("negative", results[0].Warnings[0]);
+    }
+
+    [Fact]
     public void Map_NotGridAligned_SkipsFrameAndWarns()
     {
         var achj = AchjWithChain("Unaligned", PixelFrame(4, 0, 20, 32));
@@ -134,6 +202,17 @@ public class AchjToTiledAnimationMapperTests
 
         Assert.Empty(results[0].Frames);
         Assert.Contains("doesn't match tile size", results[0].Warnings[0]);
+    }
+
+    [Fact]
+    public void Map_TallySkipsTrue_RowOutOfRangeTalliedInSkipCounts()
+    {
+        var achj = AchjWithChain("Corrupt", PixelFrame(0, 128, 16, 160));
+
+        var results = AchjToTiledAnimationMapper.Map(achj, TilesetInfo, tallySkips: true);
+
+        Assert.Empty(results[0].Warnings);
+        Assert.Equal(1, results[0].SkipCounts.RowOutOfRange);
     }
 
     [Fact]

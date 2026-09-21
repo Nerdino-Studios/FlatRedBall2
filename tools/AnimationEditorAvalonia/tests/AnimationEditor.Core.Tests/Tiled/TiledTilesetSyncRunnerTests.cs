@@ -119,4 +119,62 @@ public class TiledTilesetSyncRunnerTests
         Assert.False(outcomes[0].Success);
         Assert.NotNull(outcomes[0].Error);
     }
+
+    [Fact]
+    public void SyncAll_SecondTsxInBatchThrows_FirstTsxWriteAlreadyOnDiskStaysFullyCorrect()
+    {
+        var tempDir = Directory.CreateTempSubdirectory().FullName;
+        var goodTsxPath = WriteFixtureTileset(tempDir, "Heroes.tsx");
+        var brokenTsxPath = Path.Combine(tempDir, "DoesNotExist.tsx");
+        var achxPath = Path.Combine(tempDir, "Hero.achx");
+
+        var outcomes = TiledTilesetSyncRunner.SyncAll(AchjWithWalkChain(), achxPath, [goodTsxPath, brokenTsxPath]);
+
+        Assert.True(outcomes[0].Success);
+        Assert.False(outcomes[1].Success);
+        Assert.NotNull(outcomes[1].Error);
+
+        // Reload from disk (not the in-memory outcome) to prove tsx #1's completed write wasn't
+        // half-applied or corrupted by tsx #2's later failure in the same batch.
+        var reloaded = Loader.Default().LoadTileset(goodTsxPath);
+        var tile0 = reloaded.Tiles.Single(t => t.ID == 0);
+        Assert.Equal([((uint)0, 100), ((uint)1, 100)], tile0.Animation.Select(f => (f.TileID, f.Duration)));
+        Assert.Equal("Walk", tile0.GetProperty<StringProperty>("achjAnimationName").Value);
+    }
+
+    // Pins that SyncAll's blanket `catch (Exception ex)` doesn't flatten the failure to a generic
+    // message -- it stores the exact original exception (type + message intact) on the outcome, so
+    // a genuine collision (InvalidOperationException, from TilesetAnimationSync's ownership check)
+    // stays distinguishable from an I/O failure (e.g. FileNotFoundException, asserted separately
+    // above in SyncAll_UnreadableTsxPath_ReportsFailureWithoutThrowing) by callers that inspect
+    // outcome.Error's runtime type rather than just its Message.
+    [Fact]
+    public void SyncAll_TwoChainsClaimSameEntryTile_OutcomeErrorPreservesExactExceptionTypeAndMessage()
+    {
+        var tempDir = Directory.CreateTempSubdirectory().FullName;
+        var tsxPath = WriteFixtureTileset(tempDir);
+        var achxPath = Path.Combine(tempDir, "Hero.achx");
+        var save = new AnimationChainListSave { CoordinateType = TextureCoordinateType.Pixel };
+        var walk = new AnimationChainSave { Name = "Walk" };
+        walk.Frames.Add(new AnimationFrameSave
+        {
+            TextureName = "Heroes.png", FrameLength = 0.1f,
+            LeftCoordinate = 0, TopCoordinate = 0, RightCoordinate = 16, BottomCoordinate = 16,
+        });
+        var idle = new AnimationChainSave { Name = "Idle" };
+        idle.Frames.Add(new AnimationFrameSave
+        {
+            TextureName = "Heroes.png", FrameLength = 0.1f,
+            LeftCoordinate = 0, TopCoordinate = 0, RightCoordinate = 16, BottomCoordinate = 16,
+        });
+        save.AnimationChains.Add(walk);
+        save.AnimationChains.Add(idle);
+
+        var outcomes = TiledTilesetSyncRunner.SyncAll(save, achxPath, [tsxPath]);
+
+        Assert.False(outcomes[0].Success);
+        var error = Assert.IsType<System.InvalidOperationException>(outcomes[0].Error);
+        Assert.Contains("Walk", error.Message);
+        Assert.Contains("Idle", error.Message);
+    }
 }

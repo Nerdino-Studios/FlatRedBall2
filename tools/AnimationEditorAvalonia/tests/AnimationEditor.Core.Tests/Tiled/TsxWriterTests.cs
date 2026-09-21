@@ -1,6 +1,7 @@
 using AnimationEditor.Core.Tiled;
 using DotTiled;
 using DotTiled.Serialization;
+using System;
 using System.IO;
 using System.Linq;
 using Xunit;
@@ -476,6 +477,59 @@ public class TsxWriterTests
     }
 
     [Fact]
+    public void Write_OriginalFileTilesNotInAscendingIdOrder_SortBeforeWriteReusesSlicesReorderedNotCorrupted()
+    {
+        // Tiled doesn't strictly guarantee ascending <tile> order in a real file, and both
+        // NativeTsxAnimationSync.Apply and TilesetAnimationSync.Apply always run
+        // tileset.Tiles.Sort((a, b) => a.ID.CompareTo(b.ID)) before handing the tileset to
+        // TsxWriter.Write. originalSlicesById/originalTilesById are keyed by id (not by original
+        // position), so lookups during the final foreach (over the now-sorted list) are
+        // order-independent -- this pins that no corruption/loss occurs, only a reordering.
+        const string outOfOrderXml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<tileset version=\"1.10\" tiledversion=\"1.12.2\" name=\"OutOfOrder\" tilewidth=\"16\" tileheight=\"16\" tilecount=\"64\" columns=\"8\">\n" +
+            " <image source=\"OutOfOrder.png\" width=\"128\" height=\"128\"/>\n" +
+            " <tile id=\"12\" type=\"Chest\"/>\n" +
+            " <tile id=\"5\">\n" +
+            "  <animation>\n" +
+            "   <frame tileid=\"5\" duration=\"200\"/>\n" +
+            "   <frame tileid=\"6\" duration=\"200\"/>\n" +
+            "  </animation>\n" +
+            " </tile>\n" +
+            " <tile id=\"8\" type=\"Rock\"/>\n" +
+            "</tileset>\n";
+        var tileset = WriteLegacyFixture(Directory.CreateTempSubdirectory().FullName, out var path, outOfOrderXml);
+        tileset.Tiles.Sort((a, b) => a.ID.CompareTo(b.ID));
+
+        TsxWriter.Write(tileset, path);
+        var written = File.ReadAllText(path);
+
+        // Each unchanged tile's original slice text reused verbatim, just re-emitted in the new
+        // (ascending) order -- not regenerated, not merged, not dropped.
+        Assert.Equal(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<tileset version=\"1.10\" tiledversion=\"1.12.2\" name=\"OutOfOrder\" tilewidth=\"16\" tileheight=\"16\" tilecount=\"64\" columns=\"8\">\n" +
+            " <image source=\"OutOfOrder.png\" width=\"128\" height=\"128\"/>\n" +
+            " <tile id=\"5\">\n" +
+            "  <animation>\n" +
+            "   <frame tileid=\"5\" duration=\"200\"/>\n" +
+            "   <frame tileid=\"6\" duration=\"200\"/>\n" +
+            "  </animation>\n" +
+            " </tile>\n" +
+            " <tile id=\"8\" type=\"Rock\"/>\n" +
+            " <tile id=\"12\" type=\"Chest\"/>\n" +
+            "</tileset>\n",
+            written);
+
+        var reloaded = Loader.Default().LoadTileset(path);
+        Assert.Equal(3, reloaded.Tiles.Count);
+        Assert.Equal([((uint)5, 200), ((uint)6, 200)],
+            reloaded.Tiles.Single(t => t.ID == 5).Animation.Select(f => (f.TileID, f.Duration)));
+        Assert.Equal("Rock", reloaded.Tiles.Single(t => t.ID == 8).Type);
+        Assert.Equal("Chest", reloaded.Tiles.Single(t => t.ID == 12).Type);
+    }
+
+    [Fact]
     public void Write_TileRemoved_OmitsThatTileExactly()
     {
         var tileset = WriteLegacyFixture(Directory.CreateTempSubdirectory().FullName, out var path);
@@ -540,6 +594,45 @@ public class TsxWriterTests
         Assert.Equal("2", reloaded.GetProperty<StringProperty>("schemaVersion").Value);
         var tile5 = reloaded.Tiles.Single(t => t.ID == 5);
         Assert.Equal([((uint)5, 200), ((uint)6, 200)], tile5.Animation.Select(f => (f.TileID, f.Duration)));
+    }
+
+    [Fact]
+    public void Write_TopLevelPropertiesReorderedButContentUnchanged_FallsBackButStaysCorrect()
+    {
+        // TopLevelEquals's PropertiesEqual compares tileset-level properties position-by-position
+        // (Zip), so a hand-edit (or another tool) that reorders them without changing their
+        // content is seen as "different" and triggers the same full-rewrite fallback as an actual
+        // content change -- accepted as a known cosmetic limitation, same "full rewrite is always
+        // a safe fallback" tradeoff already accepted for tileset.Tiles ordering. Pins that the
+        // fallback still produces correct content (not corruption), and that it really is the
+        // fallback path that ran: the written file's property order matches the in-memory
+        // (reversed) order, not the original on-disk order, which only a full rewrite -- not a
+        // patch reusing the original prologue byte-for-byte -- would produce.
+        const string xmlWithProperties =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<tileset version=\"1.10\" tiledversion=\"1.12.2\" name=\"Legacy\" tilewidth=\"16\" tileheight=\"16\" tilecount=\"64\" columns=\"8\">\n" +
+            " <image source=\"Legacy.png\" width=\"128\" height=\"128\"/>\n" +
+            " <properties>\n" +
+            "  <property name=\"schemaVersion\" value=\"1\"/>\n" +
+            "  <property name=\"author\" value=\"Vic\"/>\n" +
+            " </properties>\n" +
+            " <tile id=\"5\" type=\"Rock\"/>\n" +
+            "</tileset>\n";
+        var tileset = WriteLegacyFixture(Directory.CreateTempSubdirectory().FullName, out var path, xmlWithProperties);
+
+        // Same two properties, reversed order, no actual content edit.
+        var reordered = tileset.Properties.AsEnumerable().Reverse().ToList();
+        tileset.Properties.Clear();
+        tileset.Properties.AddRange(reordered);
+
+        TsxWriter.Write(tileset, path);
+        var written = File.ReadAllText(path);
+        var reloaded = Loader.Default().LoadTileset(path);
+
+        Assert.True(written.IndexOf("author", StringComparison.Ordinal) < written.IndexOf("schemaVersion", StringComparison.Ordinal));
+        Assert.Equal("1", reloaded.GetProperty<StringProperty>("schemaVersion").Value);
+        Assert.Equal("Vic", reloaded.GetProperty<StringProperty>("author").Value);
+        Assert.Equal("Rock", reloaded.Tiles.Single(t => t.ID == 5).Type);
     }
 
     [Fact]

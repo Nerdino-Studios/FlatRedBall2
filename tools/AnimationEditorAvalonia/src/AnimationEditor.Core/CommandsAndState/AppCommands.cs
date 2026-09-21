@@ -494,9 +494,20 @@ namespace AnimationEditor.Core.CommandsAndState
         /// <inheritdoc/>
         public event Action<string, int>? TiledSyncSucceeded;
 
+        /// <inheritdoc/>
+        public Func<string, bool>? IsTsxPathOpenAsNativeProject { get; set; }
+
         public void AddAssociatedTiledTileset(string tsxAbsolutePath)
         {
             if (string.IsNullOrEmpty(_pm.FileName)) return;
+
+            if (IsTsxPathOpenAsNativeProject?.Invoke(tsxAbsolutePath) == true)
+                throw new InvalidOperationException(
+                    $"Cannot associate \"{tsxAbsolutePath}\" -- it is currently open as a native " +
+                    "AnimationEditor project in another tab. Close that tab first, or choose a " +
+                    "different .tsx file. A .tsx cannot be both a native-tsx project and an " +
+                    "achx-push target at the same time.");
+
             _ioManager.AddAssociatedTiledTilesetPath(_pm.FileName, tsxAbsolutePath);
         }
 
@@ -508,7 +519,14 @@ namespace AnimationEditor.Core.CommandsAndState
                 "Associate Tiled Tileset", "tsx", "Tiled Tileset (*.tsx)");
             if (string.IsNullOrEmpty(path)) return;
 
-            AddAssociatedTiledTileset(path);
+            try
+            {
+                AddAssociatedTiledTileset(path);
+            }
+            catch (Exception ex)
+            {
+                TiledSyncFailed?.Invoke(path, ex);
+            }
         }
 
         /// <summary>
@@ -584,13 +602,20 @@ namespace AnimationEditor.Core.CommandsAndState
                 : new FilePath(_pm.FileName).Extension;
             var defaultExtension = string.IsNullOrEmpty(currentExtension) ? "achj" : currentExtension;
 
-            var path = await FileDialogService.PickSaveFileAsync(
-                "Save Animation Chain", defaultExtension,
-                new[]
+            // A native tsx project's Save As must offer only its own format -- SaveTsxProject
+            // always writes Tiled tileset XML regardless of the target path's extension (see
+            // SaveCurrentAnimationChainList below), so letting the achj/achx choices through here
+            // would let the user save tsx content under a misleading .achx/.achj name.
+            var fileTypeChoices = _pm.IsNativeTsxProject
+                ? new[] { new FileTypeChoice("tsx", "Tiled Tileset (*.tsx)") }
+                : new[]
                 {
                     new FileTypeChoice("achj", "Animation Chain JSON (*.achj)"),
                     new FileTypeChoice("achx", "Animation Chain XML (*.achx)")
-                });
+                };
+
+            var path = await FileDialogService.PickSaveFileAsync(
+                "Save Animation Chain", defaultExtension, fileTypeChoices);
 
             if (string.IsNullOrEmpty(path)) return;
 
@@ -1802,9 +1827,10 @@ namespace AnimationEditor.Core.CommandsAndState
         /// </summary>
         public void NewFile()
         {
-            _pm.AnimationChainListSave = new AnimationChainListSave();
-            _pm.FileName = string.Empty;
-            _pm.OnDiskCoordinateType = FlatRedBall2.AnimationEditorCommon.TextureCoordinateType.Pixel;
+            // ResetToBlankDocument covers AnimationChainListSave/FileName/OnDiskCoordinateType
+            // plus every native-tsx/texture-size/ReferencedPngs tracking field a reused
+            // ProjectManager instance could otherwise leak from the previously-active tab (#1147).
+            _pm.ResetToBlankDocument();
             _selectedState.SelectedChain = null;
             _selectedState.SelectedFrame = null;
             _undoManager.Clear();
@@ -1815,10 +1841,11 @@ namespace AnimationEditor.Core.CommandsAndState
         /// <inheritdoc cref="IAppCommands.CloseProject"/>
         public void CloseProject()
         {
-            _pm.AnimationChainListSave = new AnimationChainListSave();
-            _pm.FileName = null;
+            // See the matching comment in NewFile -- ResetToBlankDocument covers everything a
+            // closed project needs cleared except ProjectFolderPath, which is session-wide (see
+            // its own doc comment) and reset separately here.
+            _pm.ResetToBlankDocument();
             _pm.ProjectFolderPath = null;
-            _pm.OnDiskCoordinateType = FlatRedBall2.AnimationEditorCommon.TextureCoordinateType.Pixel;
             _selectedState.Reset();
             _undoManager.Clear();
             // No content survives a close, so remove any crash-recovery file rather than
@@ -2253,7 +2280,16 @@ namespace AnimationEditor.Core.CommandsAndState
 
             try
             {
-                _pm.LoadAnimationChain(new AnimationEditor.Core.Paths.FilePath(path));
+                // SyncHotReloadWatcher watches whatever IProjectManager.FileName currently is,
+                // tsx or achx/achj alike, with no extension check -- so this must route a tsx
+                // path to LoadTsxProject. LoadAnimationChain's hand-rolled XML parser doesn't
+                // validate the root element name, so it would silently "succeed" against a
+                // tsx's <tileset> root with zero chains instead of throwing.
+                var filePath = new AnimationEditor.Core.Paths.FilePath(path);
+                if (filePath.Extension == "tsx")
+                    _pm.LoadTsxProject(filePath);
+                else
+                    _pm.LoadAnimationChain(filePath);
             }
             catch (Exception ex)
             {
