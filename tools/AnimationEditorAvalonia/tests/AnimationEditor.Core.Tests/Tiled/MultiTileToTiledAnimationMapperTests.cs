@@ -181,4 +181,92 @@ public class MultiTileToTiledAnimationMapperTests
         Assert.Empty(result.Warnings);
         Assert.Null(result.EntryTileId);
     }
+
+    // ── Fresh satellites sit next to the ENTRY tile, not next to the frames ──────────────────
+    // TiledAnimationToAchjMapper reads a satellite's offset from the anchor tile's static grid
+    // position, so a hand-authored owner tile unrelated to its frames needs its new satellites
+    // placed beside the owner, or they come back as unattached anchors on the next load.
+
+    [Fact]
+    public void Map_EntryHintUnrelatedToFrames_FreshSatelliteSitsNextToEntryTile()
+    {
+        // Frame is cols 0-1 at row 0 (tiles 0, 1); the owner tile is 8 (row 2, col 0).
+        var achj = AchjWithChain("Walk", PixelFrame(0, 0, 32, 16));
+        var hints = new Dictionary<AnimationChainSave, uint> { [achj.AnimationChains[0]] = 8 };
+
+        var result = Assert.Single(MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo, hints));
+
+        var satellite = Assert.Single(result.Satellites);
+        Assert.Equal((uint)9, satellite.TileId);
+        Assert.Equal([new MappedFrame(1, 100)], satellite.Frames);
+    }
+
+    [Fact]
+    public void Map_EntryHintInLastColumn_TwoWideFrame_SkipsChainAndWarnsInsteadOfWrappingIntoNextRow()
+    {
+        // Frame is cols 0-1 at row 0; the owner tile is 3 (row 0, last col), so its (1,0)
+        // satellite has no column to land in.
+        var achj = AchjWithChain("Walk", PixelFrame(0, 0, 32, 16));
+        var hints = new Dictionary<AnimationChainSave, uint> { [achj.AnimationChains[0]] = 3 };
+
+        var result = Assert.Single(MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo, hints));
+
+        Assert.Empty(result.AnchorFrames);
+        Assert.Contains("owner tile 3", Assert.Single(result.Warnings));
+    }
+
+    [Fact]
+    public void Map_EntryHintInLastRow_TwoTallFrame_SkipsChainAndWarnsInsteadOfFabricatingOutOfRangeTile()
+    {
+        // Frame is rows 0-1 at col 0; the owner tile is 12 (last row), so its (0,1) satellite
+        // would be tile 16, past the 16-tile tileset.
+        var achj = AchjWithChain("Walk", PixelFrame(0, 0, 16, 32));
+        var hints = new Dictionary<AnimationChainSave, uint> { [achj.AnimationChains[0]] = 12 };
+
+        var result = Assert.Single(MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo, hints));
+
+        Assert.Empty(result.AnchorFrames);
+        Assert.Contains("owner tile 12", Assert.Single(result.Warnings));
+    }
+
+    // ── EntryTileIdIsFreshlyComputed (tile-ownership-transfer signal) ────────────────────────
+    // ProjectManager uses this to tell "the hint was actually used as-is" (possibly a
+    // hand-authored owner tile that's intentionally unrelated to frame 0's own geometry, must
+    // never be silently discarded) apart from "no hint existed, so this is exactly frame 0's own
+    // computed top-left tile" (safe to treat as ours to relocate later if geometry moves).
+
+    [Fact]
+    public void Map_NoEntryHint_EntryTileIdIsFreshlyComputedIsTrue()
+    {
+        var achj = AchjWithChain("Idle", PixelFrame(0, 0, 16, 16));
+
+        var result = Assert.Single(MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo));
+
+        Assert.True(result.EntryTileIdIsFreshlyComputed);
+    }
+
+    [Fact]
+    public void Map_EntryHintProvided_EntryTileIdIsFreshlyComputedIsFalse()
+    {
+        var achj = AchjWithChain("Idle", PixelFrame(0, 0, 16, 16));
+        var chain = achj.AnimationChains[0];
+        var hints = new Dictionary<AnimationChainSave, uint> { [chain] = 7 };
+
+        var result = Assert.Single(MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo, hints));
+
+        Assert.Equal((uint)7, result.EntryTileId);
+        Assert.False(result.EntryTileIdIsFreshlyComputed);
+    }
+
+    [Fact]
+    public void Map_MappingFailsButHasKnownEntryHint_EntryTileIdIsFreshlyComputedIsFalse()
+    {
+        var achj = AchjWithChain("Bad", PixelFrame(0, 0, 20, 16));
+        var chain = achj.AnimationChains[0];
+        var hints = new Dictionary<AnimationChainSave, uint> { [chain] = 5 };
+
+        var result = Assert.Single(MultiTileToTiledAnimationMapper.Map(achj, TilesetInfo, hints));
+
+        Assert.False(result.EntryTileIdIsFreshlyComputed);
+    }
 }
