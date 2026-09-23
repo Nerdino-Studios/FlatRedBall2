@@ -3,6 +3,7 @@ using AnimationEditor.Core.CommandsAndState;
 using FlatRedBall2.AnimationEditorCommon;
 using System.Collections.Generic;
 using System.Linq;
+using Shouldly;
 using Xunit;
 
 namespace AnimationEditor.Core.Tests;
@@ -24,6 +25,39 @@ public class AppCommandsShapeTests
         ctx.AppCommands.AddAxisAlignedRectangle(frame);
 
         Assert.Single(frame.ShapesSave!.AARectSaves);
+    }
+
+    [Fact]
+    public void AddAxisAlignedRectangle_ThenUndo_OnAFrameWithNoShapes_LeavesShapesSaveNull()
+    {
+        // An empty ShapesSave still serializes as a <ShapeCollectionSave> block, so a frame that
+        // never had shapes must go back to having none, or "undo everything" changes the file.
+        var ctx = TestHelpers.SetupFreshAcls();
+        var chain = TestHelpers.MakeChain(ctx.Acls, "Walk", 1);
+        var frame = chain.Frames[0];
+        frame.ShapesSave = null;
+        ctx.SelectedState.SelectedFrame = frame;
+        ctx.AppCommands.AddAxisAlignedRectangle(frame);
+
+        ctx.UndoManager.Undo();
+
+        frame.ShapesSave.ShouldBeNull();
+    }
+
+    [Fact]
+    public void AddAxisAlignedRectangle_ThenUndo_OnAFrameThatHadShapes_KeepsTheOthers()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        var chain = TestHelpers.MakeChain(ctx.Acls, "Walk", 1);
+        var frame = chain.Frames[0];
+        ctx.SelectedState.SelectedFrame = frame;
+        ctx.AppCommands.AddCircle(frame);
+        ctx.AppCommands.AddAxisAlignedRectangle(frame);
+
+        ctx.UndoManager.Undo();
+
+        frame.ShapesSave!.Shapes.Count.ShouldBe(1);
+        frame.ShapesSave.CircleSaves.Count().ShouldBe(1);
     }
 
     [Fact]
@@ -107,6 +141,21 @@ public class AppCommandsShapeTests
         ctx.AppCommands.AddCircle(frame);
 
         Assert.Single(frame.ShapesSave!.CircleSaves);
+    }
+
+    [Fact]
+    public void AddCircle_ThenUndo_OnAFrameWithNoShapes_LeavesShapesSaveNull()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        var chain = TestHelpers.MakeChain(ctx.Acls, "Walk", 1);
+        var frame = chain.Frames[0];
+        frame.ShapesSave = null;
+        ctx.SelectedState.SelectedFrame = frame;
+        ctx.AppCommands.AddCircle(frame);
+
+        ctx.UndoManager.Undo();
+
+        frame.ShapesSave.ShouldBeNull();
     }
 
     [Fact]
@@ -307,6 +356,75 @@ public class AppCommandsShapeTests
     }
 
     // ── MatchRectangleToFrame / MatchCircleToFrame ───────────────────────────
+
+    /// <summary>A project whose Tex.png is <paramref name="width"/> x <paramref name="height"/>, so frame sizes resolve to pixels.</summary>
+    private static string SetupProjectWithTexture(TestServices ctx, int width, int height)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "AnimationEditorCoreTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        byte[] header = new byte[24];
+        header[0] = 0x89; header[1] = 0x50; header[2] = 0x4E; header[3] = 0x47;
+        header[4] = 0x0D; header[5] = 0x0A; header[6] = 0x1A; header[7] = 0x0A;
+        header[11] = 13; header[12] = 0x49; header[13] = 0x48; header[14] = 0x44; header[15] = 0x52;
+        header[16] = (byte)(width >> 24); header[17] = (byte)(width >> 16); header[18] = (byte)(width >> 8); header[19] = (byte)width;
+        header[20] = (byte)(height >> 24); header[21] = (byte)(height >> 16); header[22] = (byte)(height >> 8); header[23] = (byte)height;
+        File.WriteAllBytes(Path.Combine(dir, "Tex.png"), header);
+        ctx.ProjectManager.FileName = Path.Combine(dir, "test.achx");
+        return dir;
+    }
+
+    [Fact]
+    public void MatchRectangleToFrame_SetsScaleToHalfTheFramePixelSize()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        SetupProjectWithTexture(ctx, 64, 64);
+        var frame = TestHelpers.MakeFrame();
+        frame.LeftCoordinate = 0f; frame.RightCoordinate = 0.5f;   // 32 px wide
+        frame.TopCoordinate = 0f; frame.BottomCoordinate = 0.25f;  // 16 px tall
+        var rect = new AARectSave { ScaleX = 3f, ScaleY = 3f };
+
+        ctx.AppCommands.MatchRectangleToFrame(rect, frame);
+
+        rect.ScaleX.ShouldBe(16f);
+        rect.ScaleY.ShouldBe(8f);
+    }
+
+    [Fact]
+    public void MatchRectangleToFrame_WithAnUnknownTextureSize_KeepsTheScale()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        var frame = TestHelpers.MakeFrame("missing.png");
+        var rect = new AARectSave { ScaleX = 3f, ScaleY = 5f };
+
+        ctx.AppCommands.MatchRectangleToFrame(rect, frame);
+
+        (rect.ScaleX, rect.ScaleY).ShouldBe((3f, 5f));
+    }
+
+    [Fact]
+    public void MatchRectanglesToFrames_SizesEachRectangleFromItsOwnFrame_AsOneUndoStep()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        SetupProjectWithTexture(ctx, 64, 64);
+        var chain = TestHelpers.MakeChain(ctx.Acls, "Walk", 2);
+        chain.Frames[0].TextureName = "Tex.png";
+        chain.Frames[1].TextureName = "Tex.png";
+        chain.Frames[0].LeftCoordinate = 0f; chain.Frames[0].RightCoordinate = 0.5f;
+        chain.Frames[0].TopCoordinate = 0f; chain.Frames[0].BottomCoordinate = 0.5f;
+        chain.Frames[1].LeftCoordinate = 0f; chain.Frames[1].RightCoordinate = 0.25f;
+        chain.Frames[1].TopCoordinate = 0f; chain.Frames[1].BottomCoordinate = 1f;
+        var first = new AARectSave { Name = "A", ScaleX = 1f, ScaleY = 1f };
+        var second = new AARectSave { Name = "B", ScaleX = 1f, ScaleY = 1f };
+        chain.Frames[0].ShapesSave = new ShapesSave { Shapes = { first } };
+        chain.Frames[1].ShapesSave = new ShapesSave { Shapes = { second } };
+
+        ctx.AppCommands.MatchRectanglesToFrames(new List<AARectSave> { first, second });
+
+        (first.ScaleX, first.ScaleY).ShouldBe((16f, 16f));
+        (second.ScaleX, second.ScaleY).ShouldBe((8f, 32f));
+        ctx.UndoManager.Undo();
+        (first.ScaleX, second.ScaleY).ShouldBe((1f, 1f));
+    }
 
     [Fact]
     public void MatchRectangleToFrame_SetsRectangleXFromFrameRelativeX()

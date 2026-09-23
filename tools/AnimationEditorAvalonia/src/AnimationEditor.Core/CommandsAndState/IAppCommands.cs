@@ -103,8 +103,11 @@ namespace AnimationEditor.Core.CommandsAndState
         /// UV-format files require all referenced textures to be resolvable; missing
         /// textures fire <see cref="LoadFailed"/> and abort the load. UV files with all
         /// textures present prompt via <see cref="AppCommands.ConfirmAsync"/> before converting.
+        /// Returns true when the file ended up loaded; false when it was refused (missing
+        /// textures, conversion declined, unreadable file) and the editor's document is unchanged,
+        /// so a caller that registered a tab for the path first can take it back.
         /// </summary>
-        Task OpenAchxWorkflowAsync(string path);
+        Task<bool> OpenAchxWorkflowAsync(string path);
         void LoadAnimationChain(string fileName);
 
         /// <summary>
@@ -112,16 +115,18 @@ namespace AnimationEditor.Core.CommandsAndState
         /// #1140) -- see <see cref="ProjectManager.LoadTsxProject"/>. Unlike <see
         /// cref="OpenAchxWorkflowAsync"/>, there is no conversion prompt: an incompatible tsx
         /// (wangsets/transformations/etc.) fires <see cref="LoadFailed"/> and aborts immediately.
+        /// Returns true when the tileset ended up loaded, false when it was refused.
         /// </summary>
-        Task OpenTsxWorkflowAsync(string path);
+        Task<bool> OpenTsxWorkflowAsync(string path);
 
         /// <summary>
         /// Dispatches to <see cref="OpenTsxWorkflowAsync"/> for a <c>.tsx</c> path, otherwise <see
         /// cref="OpenAchxWorkflowAsync"/> -- the single entry point every tab-open call site should
         /// use, so a native tsx project needs no changes to <c>TabKind</c>/<c>TabManager</c>
         /// (<c>TabEntry.InferKind</c> already treats a non-png extension as a full-editor tab).
+        /// Returns whichever result the workflow it dispatched to returned.
         /// </summary>
-        Task OpenProjectWorkflowAsync(string path);
+        Task<bool> OpenProjectWorkflowAsync(string path);
 
         /// <summary>
         /// Stores the current project model and chain/frame selection on <paramref name="tab"/>
@@ -138,9 +143,15 @@ namespace AnimationEditor.Core.CommandsAndState
 
         /// <summary>
         /// Activates <paramref name="tab"/>'s content from cache when possible; otherwise runs
-        /// <see cref="OpenAchxWorkflowAsync"/>. Does not restore undo.
+        /// <see cref="OpenProjectWorkflowAsync"/>. Does not restore undo.
         /// </summary>
-        Task ActivateTabContentAsync(TabEntry tab);
+        /// <returns>
+        /// <c>false</c> when the disk reload failed (missing texture, declined UV conversion,
+        /// unreadable file) -- the live document is left as whatever was active before the call,
+        /// and <paramref name="tab"/>'s own cache and selection are left untouched rather than
+        /// being overwritten with that other document.
+        /// </returns>
+        Task<bool> ActivateTabContentAsync(TabEntry tab);
 
         /// <summary>
         /// Restores chain/frame selection from <paramref name="tab"/>'s cached selection fields
@@ -163,6 +174,13 @@ namespace AnimationEditor.Core.CommandsAndState
         void RefreshTreeView();
         void SaveCurrentAnimationChainList(string? fileName = null);
         Task SaveCurrentAnimationChainListAsync();
+        /// <summary>
+        /// Writes a document other than the current one to its own file, in that file's disk
+        /// format: a cross-document cut removes chains from a background tab's model, and unless
+        /// that model reaches disk the chain comes back from the file on the next load or reload.
+        /// A failure is reported through <see cref="SaveFailed"/>.
+        /// </summary>
+        void SaveDocument(AnimationChainListSave document, string targetPath, TextureCoordinateType diskFormat);
         Task ExportToPixiJsAsync();
         void DeleteAnimationChains(List<AnimationChainSave> animationChains);
         void AddAxisAlignedRectangle(AnimationFrameSave frame);

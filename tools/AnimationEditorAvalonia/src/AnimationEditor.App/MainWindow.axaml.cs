@@ -219,7 +219,8 @@ public partial class MainWindow : Window
         ProjectTreeThumbnailService projectTreeThumbnailService,
         IFileAssociationService fileAssociation,
         string applicationDataRoot,
-        IApplicationUpdater? applicationUpdater = null)
+        IApplicationUpdater? applicationUpdater = null,
+        IEditorDialogHost? dialogHost = null)
     {
         _applicationDataRoot = applicationDataRoot;
 
@@ -236,7 +237,10 @@ public partial class MainWindow : Window
         _projectTreeThumbnailService = projectTreeThumbnailService;
         _fileAssociation = fileAssociation;
         _applicationUpdater = applicationUpdater ?? new NoOpApplicationUpdater();
-        _dialogHost = new WindowEditorDialogHost(this);
+        // The dialogs that open straight through EditorDialogs (Adjust Frame Time, Add Multiple
+        // Frames, Adjust Offsets, ...) go through this host; a test passes a scripted one, since a
+        // real dialog window parks until a person closes it.
+        _dialogHost = dialogHost ?? new WindowEditorDialogHost(this);
         // Desktop renders the tree with its own _treeRoots collection, so the controller
         // reads expand state from there (browser reads its AnimationTreeControl instead).
         _tabController = new TabController(_undoManager, _appCommands,
@@ -774,9 +778,11 @@ public partial class MainWindow : Window
         }
         else
         {
-            await _appCommands.ActivateTabContentAsync(tab);
-            // LoadAnimationChain cleared the stack — restore this tab's saved history.
-            if (tab.UndoSnapshot != null)
+            // A failed reload (missing texture, declined UV conversion, unreadable file) leaves
+            // the previous tab's document still live -- restoring *this* tab's undo snapshot onto
+            // it would apply the wrong tab's history to the wrong document.
+            bool activated = await _appCommands.ActivateTabContentAsync(tab);
+            if (activated && tab.UndoSnapshot != null)
                 _undoManager.RestoreSnapshot(tab.UndoSnapshot);
         }
         SyncProjectPanelSelectionTo(tab);
@@ -917,24 +923,34 @@ public partial class MainWindow : Window
         }
         else
         {
-            // All tabs closed — start fresh. ResetToBlankDocument (#1147) also clears any
-            // native-tsx/texture-size/ReferencedPngs state the just-closed tab left behind.
-            ShowAchxPane();
-            _projectManager.ResetToBlankDocument();
-            _selectedState.Reset();
-            _undoManager.Clear();
-            ProjectPanel.SyncSelectionToActiveFile(null);
-            RefreshTreeView();
-            RefreshFilesPanel();
-            UpdateTitle();
-            UpdateStatusBar();
+            ResetToNoTabsOpen();
         }
+    }
+
+    /// <summary>
+    /// Returns the editor to its startup-empty state: no document, no selection, no undo history.
+    /// Called whenever the last open tab goes away, whether by closing it (<see cref="CloseTabCore"/>)
+    /// or because it failed to load and was dropped (<see cref="RestoreTabsAsync"/>).
+    /// </summary>
+    private void ResetToNoTabsOpen()
+    {
+        // ResetToBlankDocument (#1147) also clears any native-tsx/texture-size/ReferencedPngs
+        // state the last tab left behind.
+        ShowAchxPane();
+        _projectManager.ResetToBlankDocument();
+        _selectedState.Reset();
+        _undoManager.Clear();
+        ProjectPanel.SyncSelectionToActiveFile(null);
+        RefreshTreeView();
+        RefreshFilesPanel();
+        UpdateTitle();
+        UpdateStatusBar();
     }
 
     private async Task ActivateTabAfterCloseAsync(TabEntry tab)
     {
-        await _appCommands.ActivateTabContentAsync(tab);
-        if (tab.UndoSnapshot != null)
+        bool activated = await _appCommands.ActivateTabContentAsync(tab);
+        if (activated && tab.UndoSnapshot != null)
             _undoManager.RestoreSnapshot(tab.UndoSnapshot);
         SyncProjectPanelSelectionTo(tab);
         RebuildTabStrip();
@@ -972,9 +988,24 @@ public partial class MainWindow : Window
         if (active != null)
         {
             if (active.Kind == TabKind.Png)
+            {
                 ShowPngPane(active);
+            }
             else
-                await _appCommands.OpenProjectWorkflowAsync(active.Path.FullPath);
+            {
+                bool opened = await _appCommands.OpenProjectWorkflowAsync(active.Path.FullPath);
+                if (!opened)
+                {
+                    // The file that was open when the editor last closed no longer opens (missing
+                    // texture, declined UV conversion, unreadable file) -- restoring it as a ghost
+                    // active tab would show nothing behind it, so drop it the same way a refused
+                    // File > Open does.
+                    DropUnloadedTab(active.Path);
+                    if (_tabManager.ActiveTab == null)
+                        ResetToNoTabsOpen();
+                    return;
+                }
+            }
             RebuildTabStrip();
         }
     }
@@ -1237,6 +1268,24 @@ public partial class MainWindow : Window
                 if (toPromote != null && IsUntitledTab(toPromote))
                 {
                     _tabManager.Rename(toPromote.Path, new FilePath(path));
+                    RebuildTabStrip();
+                }
+            });
+        };
+        // Save As on a file-backed tab: the document now lives at the new path (auto-save writes
+        // there), so the tab follows it; otherwise the strip keeps naming the old file and a later
+        // open of that file focuses this tab's foreign content. An Untitled tab is promoted by the
+        // CurrentFileChanged handler above instead, and a path another tab holds is left alone.
+        _appCommands.SaveAsCompleted += path =>
+        {
+            var savedFrom = _tabManager.ActiveTab;
+            Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                var newPath = new FilePath(path);
+                if (savedFrom is { Kind: TabKind.Achx } && !IsUntitledTab(savedFrom) && savedFrom.Path != newPath
+                    && !_tabManager.Tabs.Any(tab => tab.Path == newPath))
+                {
+                    _tabManager.Rename(savedFrom.Path, newPath);
                     RebuildTabStrip();
                 }
             });
@@ -3297,6 +3346,14 @@ public partial class MainWindow : Window
             OnAnimTreeShiftArrowKeyDown,
             RoutingStrategies.Tunnel);
 
+        // Tunnel-phase Home/End: Avalonia's TreeView has no first/last-row navigation of its own,
+        // so a keyboard-only user at the bottom of a long tree could only hold Up. Registered
+        // after OnInlineRenameKeyDown for the same reason as the Shift+arrow handler.
+        AnimTree.AddHandler(
+            InputElement.KeyDownEvent,
+            OnAnimTreeHomeEndKeyDown,
+            RoutingStrategies.Tunnel);
+
         // Bubble-phase LostFocus from the inline TextBox: commit
         AnimTree.AddHandler(
             InputElement.LostFocusEvent,
@@ -5108,16 +5165,25 @@ public partial class MainWindow : Window
         // #897: every field above commits on ValueChanged so the wireframe/preview updates live as
         // the user types or scrolls the wheel; each commit coalesces with the previous one for the
         // same field group into a single undo entry (see IUndoableCommand.CoalesceGroup). LostFocus
-        // seals that entry so the next edit — even to the same field — starts a fresh one.
-        SealOnLostFocus(PropFrameLen, PropRelX, PropRelY, PropPixelX, PropPixelY, PropPixelW, PropPixelH,
+        // and Enter seal that entry so the next edit — even to the same field — starts a fresh one.
+        SealOnCommit(PropFrameLen, PropRelX, PropRelY, PropPixelX, PropPixelY, PropPixelW, PropPixelH,
             PropRectX, PropRectY, PropRectScaleX, PropRectScaleY,
             PropCircleX, PropCircleY, PropCircleRadius);
     }
 
-    private void SealOnLostFocus(params InputElement[] inputs)
+    private void SealOnCommit(params InputElement[] inputs)
     {
         foreach (var input in inputs)
+        {
             input.LostFocus += (_, _) => _appCommands.SealPendingEdits();
+            // Enter commits a NumericUpDown's text and the control marks the key handled, so listen
+            // after it: without this, "10 Enter, 20 Enter, Ctrl+Z" jumps back past both values
+            // because focus never left the box and nothing sealed the entry in between.
+            input.AddHandler(KeyDownEvent, (_, e) =>
+            {
+                if (e.Key == Key.Enter) _appCommands.SealPendingEdits();
+            }, RoutingStrategies.Bubble, handledEventsToo: true);
+        }
     }
 
     private void ApplyTextureName()
@@ -5889,15 +5955,24 @@ public partial class MainWindow : Window
                     StringComparison.OrdinalIgnoreCase);
                 if (!alreadyShown && !string.IsNullOrEmpty(fileName))
                 {
-                    await _appCommands.ActivateTabContentAsync(arrivedTab!);
-                    if (arrivedTab?.UndoSnapshot != null)
+                    bool activated = await _appCommands.ActivateTabContentAsync(arrivedTab!);
+                    if (activated && arrivedTab?.UndoSnapshot != null)
                         _undoManager.RestoreSnapshot(arrivedTab.UndoSnapshot);
                 }
                 RebuildTabStrip();
                 return;
             }
 
-            await _appCommands.OpenProjectWorkflowAsync(fileName);
+            bool opened = await _appCommands.OpenProjectWorkflowAsync(fileName);
+            if (!opened)
+            {
+                // The workflow refused (conversion declined, texture missing, unreadable file) and
+                // left the editor's document as it was, so the tab registered above would sit in
+                // the strip labelled with a file that never opened; closing it silently would then
+                // drop whatever the user typed under that label.
+                DropUnloadedTab(filePath);
+                return;
+            }
             // Restore this tab's prior history if it was previously open (snapshot normally
             // null on first open; non-null if the tab was closed and re-opened mid-session).
             if (arrivedTab?.UndoSnapshot != null)
@@ -5907,6 +5982,24 @@ public partial class MainWindow : Window
         {
             _suppressPreviewPromotion = false;
         }
+    }
+
+    /// <summary>
+    /// Takes back a tab that <see cref="LoadAnimationFileAsync"/> registered for a file the open
+    /// workflow then refused. Nothing was loaded, so the previous tab's content is still what the
+    /// editor shows; only the strip and the Project panel selection need to follow.
+    /// </summary>
+    private void DropUnloadedTab(FilePath path)
+    {
+        _tabManager.Close(path);
+        var next = _tabManager.ActiveTab;
+        if (next != null)
+        {
+            if (next.Kind == TabKind.Png)
+                ShowPngPane(next);
+            SyncProjectPanelSelectionTo(next);
+        }
+        RebuildTabStrip();
     }
 
     /// <summary>
@@ -6744,7 +6837,7 @@ public partial class MainWindow : Window
             if (completingCutAcrossDocuments)
             {
                 _appCommands.PasteChains(chains);
-                _pendingCutState.RemoveSourcesFrom(_pendingCutState.SourceDocument!);
+                RemoveCutSourcesAndSaveTheirDocument();
             }
             else if (completingCut)
                 _appCommands.PasteChainsCut(chains, _pendingCutState.Chains);
@@ -6761,7 +6854,7 @@ public partial class MainWindow : Window
             if (completingCutAcrossDocuments)
             {
                 _appCommands.PasteFrames(targetChain, frames, insertIndex);
-                _pendingCutState.RemoveSourcesFrom(_pendingCutState.SourceDocument!);
+                RemoveCutSourcesAndSaveTheirDocument();
             }
             else if (completingCut)
                 _appCommands.PasteFramesCut(targetChain, frames, insertIndex, _pendingCutState.Frames);
@@ -6786,7 +6879,7 @@ public partial class MainWindow : Window
             if (completingCutAcrossDocuments)
             {
                 _appCommands.PasteShapes(targetFrames, rectangles ?? [], circles ?? []);
-                _pendingCutState.RemoveSourcesFrom(_pendingCutState.SourceDocument!);
+                RemoveCutSourcesAndSaveTheirDocument();
             }
             else if (completingCut)
             {
@@ -6814,6 +6907,23 @@ public partial class MainWindow : Window
             _pendingCutState.Clear();
             SyncPendingCutHighlights();
         }
+    }
+
+    /// <summary>
+    /// Completes a cross-document cut: takes the cut items out of the document they came from and
+    /// writes that document to its file. The source is a background tab's cached model, which no
+    /// auto-save covers; left unsaved, the chain would come back from disk when that tab is closed,
+    /// reopened or hot-reloaded, leaving the project with it twice.
+    /// </summary>
+    private void RemoveCutSourcesAndSaveTheirDocument()
+    {
+        var source = _pendingCutState.SourceDocument;
+        if (source is null) return;
+        _pendingCutState.RemoveSourcesFrom(source);
+
+        var sourceTab = _tabManager.Tabs.FirstOrDefault(tab => ReferenceEquals(tab.CachedEditorModel, source));
+        if (sourceTab is null || sourceTab.Kind != TabKind.Achx || IsUntitledTab(sourceTab)) return;
+        _appCommands.SaveDocument(source, sourceTab.Path.FullPath, sourceTab.CachedOnDiskCoordinateType);
     }
 
     private void SyncPendingCutHighlights()
@@ -7030,7 +7140,7 @@ public partial class MainWindow : Window
 
         // Read current dimensions
         int oldW, oldH;
-        using (var bmp = SKBitmap.Decode(absTexPath))
+        using (var bmp = AnimationEditor.Views.Services.SkiaFileDecoder.DecodeFile(absTexPath))
         {
             if (bmp is null)
             {
@@ -7104,11 +7214,11 @@ public partial class MainWindow : Window
         string baseName   = Path.GetFileNameWithoutExtension(absTexPath);
         string newAbsPath = Path.Combine(dir, baseName + "Resize.png");
 
-        using (var src = SKBitmap.Decode(absTexPath))
+        using (var src = AnimationEditor.Views.Services.SkiaFileDecoder.DecodeFile(absTexPath))
         {
             // The file decoded fine at the top of this method, but the user has since been in a
             // modal dialog — it could have been deleted, truncated, or locked in the meantime.
-            // SKBitmap.Decode returns null (it does not throw); guard before DrawBitmap so a
+            // The decode returns null (it does not throw); guard before DrawBitmap so a
             // race doesn't crash the app on the dispatcher (issue #479).
             if (src is null)
             {
@@ -7251,13 +7361,13 @@ public partial class MainWindow : Window
         {
             e.Handled = true;
             CommitInlineRename(vm, tb.Text ?? string.Empty);
-            FocusTreeAfterRename(vm);
+            FocusTreeRow(vm);
         }
         else if (e.Key == Key.Escape)
         {
             e.Handled = true;
             vm.CancelEdit();
-            FocusTreeAfterRename(vm);
+            FocusTreeRow(vm);
         }
         else if (e.Key is Key.Left or Key.Right)
         {
@@ -7338,6 +7448,28 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
+    /// <summary>
+    /// Home selects the first visible row and End the last, as in a file manager. Visible means
+    /// after the search filter and collapsed chains, so End lands on the last row the user can
+    /// see, not on a frame hidden inside a collapsed chain. Focus follows the row so the arrow
+    /// keys carry on from there.
+    /// </summary>
+    private void OnAnimTreeHomeEndKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key is not (Key.Home or Key.End)) return;
+        if (e.Source is TextBox) return; // inline rename owns the caret keys
+
+        var visible = TreeBuilder.FlattenVisible(_treeRoots);
+        if (visible.Count == 0) return;
+
+        var target = e.Key == Key.Home ? visible[0] : visible[^1];
+        AnimTree.SelectedItems!.Clear();
+        AnimTree.SelectedItems.Add(target);
+        _treeSelectionAnchor = target;
+        FocusTreeRow(target);
+        e.Handled = true;
+    }
+
     // AnimTree (the TreeView itself) has Focusable=false — only its TreeViewItem containers
     // are focusable — so AnimTree.Focus() is always a no-op. Committing/cancelling a rename
     // also flips the TextBox's IsVisible binding off, and Avalonia's own focus-fallback (moving
@@ -7345,7 +7477,7 @@ public partial class MainWindow : Window
     // Without an explicit refocus posted after that fallback, keyboard focus ends up on
     // whatever window chrome is next in tab order (e.g. the minimize button) instead of back
     // on the row that was being renamed.
-    private void FocusTreeAfterRename(TreeNodeVm vm)
+    private void FocusTreeRow(TreeNodeVm vm)
         => Dispatcher.UIThread.Post(() =>
         {
             AnimTree.GetVisualDescendants()

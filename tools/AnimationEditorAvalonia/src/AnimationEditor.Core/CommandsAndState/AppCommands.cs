@@ -224,7 +224,7 @@ namespace AnimationEditor.Core.CommandsAndState
         // ── Open workflow ─────────────────────────────────────────────────────────
 
         /// <inheritdoc cref="IAppCommands.OpenAchxWorkflowAsync"/>
-        public async Task OpenAchxWorkflowAsync(string path)
+        public async Task<bool> OpenAchxWorkflowAsync(string path)
         {
             // Quick-parse to read CoordinateType without committing to a full load. Must dispatch
             // on extension the same way ProjectManager.LoadAnimationChain does (#878) -- a .achj
@@ -236,7 +236,7 @@ namespace AnimationEditor.Core.CommandsAndState
                     ? AnimationChainListSave.FromJsonFile(path)
                     : AnimationChainListSave.FromFile(path);
             }
-            catch (Exception ex) { LoadFailed?.Invoke(path, ex); return; }
+            catch (Exception ex) { LoadFailed?.Invoke(path, ex); return false; }
 
             string achxDir = System.IO.Path.GetDirectoryName(path) ?? string.Empty;
             var missing = _pm.FindMissingTextures(preview, achxDir);
@@ -253,7 +253,7 @@ namespace AnimationEditor.Core.CommandsAndState
                     new InvalidOperationException(
                         $"Cannot open '{System.IO.Path.GetFileName(path)}' — the following texture(s) could not be found or decoded: {names}. " +
                         "All textures must be present to convert UV coordinates to pixel coordinates."));
-                return;
+                return false;
             }
 
             if (outcome == IO.UvLoadOutcome.ConvertAndLoad || outcome == IO.UvLoadOutcome.RefuseUserDeclined)
@@ -268,7 +268,7 @@ namespace AnimationEditor.Core.CommandsAndState
                 outcome = IO.UvLoadGate.DecideOutcome(preview.CoordinateType, allTexturesResolvable: true, userConfirmed: confirmed);
             }
 
-            if (outcome == IO.UvLoadOutcome.RefuseUserDeclined) return;
+            if (outcome == IO.UvLoadOutcome.RefuseUserDeclined) return false;
 
             bool failed = false;
             void OnFail(string _, Exception __) => failed = true;
@@ -276,7 +276,7 @@ namespace AnimationEditor.Core.CommandsAndState
             try { LoadAnimationChainFromParsed(path, preview); }
             finally { LoadFailed -= OnFail; }
 
-            if (failed) return;
+            if (failed) return false;
 
             if (outcome == IO.UvLoadOutcome.ConvertAndLoad)
                 _pm.OnDiskCoordinateType = FlatRedBall2.AnimationEditorCommon.TextureCoordinateType.Pixel;
@@ -284,10 +284,11 @@ namespace AnimationEditor.Core.CommandsAndState
             _events.CallAchxLoaded(path);
             _events.RaiseCurrentFileChanged(path);
             _events.RaiseAvailableTexturesChanged();
+            return true;
         }
 
         /// <inheritdoc cref="IAppCommands.OpenTsxWorkflowAsync"/>
-        public Task OpenTsxWorkflowAsync(string path)
+        public Task<bool> OpenTsxWorkflowAsync(string path)
         {
             try
             {
@@ -296,7 +297,7 @@ namespace AnimationEditor.Core.CommandsAndState
             catch (Exception ex)
             {
                 LoadFailed?.Invoke(path, ex);
-                return Task.CompletedTask;
+                return Task.FromResult(false);
             }
 
             // Was hand-duplicating FinishLoadIntoEditor's steps here instead of calling it, and
@@ -314,11 +315,11 @@ namespace AnimationEditor.Core.CommandsAndState
             _events.CallAchxLoaded(path);
             _events.RaiseCurrentFileChanged(path);
             _events.RaiseAvailableTexturesChanged();
-            return Task.CompletedTask;
+            return Task.FromResult(true);
         }
 
         /// <inheritdoc cref="IAppCommands.OpenProjectWorkflowAsync"/>
-        public Task OpenProjectWorkflowAsync(string path) =>
+        public Task<bool> OpenProjectWorkflowAsync(string path) =>
             new FilePath(path).Extension == "tsx" ? OpenTsxWorkflowAsync(path) : OpenAchxWorkflowAsync(path);
 
         // -------------------------------------------------------------------------
@@ -423,22 +424,29 @@ namespace AnimationEditor.Core.CommandsAndState
         }
 
         /// <inheritdoc cref="IAppCommands.ActivateTabContentAsync"/>
-        public async Task ActivateTabContentAsync(TabEntry tab)
+        public async Task<bool> ActivateTabContentAsync(TabEntry tab)
         {
             if (TryActivateTabFromCache(tab))
-                return;
+                return true;
 
             // FinishLoadIntoEditor resets selection to the first chain; keep the prior
             // per-tab selection so we can restore it after the disk load.
             string? chainName = tab.CachedSelectedChainName;
             int? frameIndex = tab.CachedSelectedFrameIndex;
 
-            await OpenProjectWorkflowAsync(tab.Path.FullPath);
+            bool loaded = await OpenProjectWorkflowAsync(tab.Path.FullPath);
+            if (!loaded)
+            {
+                // The live document is still whatever the previous tab left behind -- capturing
+                // it here would poison *this* tab's cache with someone else's document.
+                return false;
+            }
 
             tab.CachedSelectedChainName = chainName;
             tab.CachedSelectedFrameIndex = frameIndex;
             RestoreTabSelection(tab);
             CaptureTabEditorState(tab);
+            return true;
         }
 
         /// <inheritdoc cref="IAppCommands.RestoreTabSelection"/>
@@ -545,6 +553,21 @@ namespace AnimationEditor.Core.CommandsAndState
             else
             {
                 _ioManager.WriteRecoveryFile(_pm.AnimationChainListSave);
+            }
+        }
+
+        /// <inheritdoc/>
+        /// <inheritdoc cref="IAppCommands.SaveDocument"/>
+        public void SaveDocument(AnimationChainListSave document, string targetPath, TextureCoordinateType diskFormat)
+        {
+            try
+            {
+                _pm.SaveAnimationChainList(document, targetPath, diskFormat);
+                HotReloadWatcher.RecordOwnSave(targetPath);
+            }
+            catch (Exception ex)
+            {
+                SaveFailed?.Invoke(ex.Message);
             }
         }
 
@@ -809,9 +832,27 @@ namespace AnimationEditor.Core.CommandsAndState
         public void MatchRectangleToFrame(AARectSave rectangle, AnimationFrameSave animationFrame)
         {
             if (IsFrameLocked(animationFrame)) return;
-            _undoManager.Execute(new MoveShapeCommand(
-                animationFrame, rectangle, rectangle.X, rectangle.Y,
-                animationFrame.RelativeX, animationFrame.RelativeY, this, _events));
+            _undoManager.Execute(MatchRectangleToFrameCommand(rectangle, animationFrame));
+        }
+
+        /// <summary>
+        /// Centres <paramref name="rectangle"/> on <paramref name="animationFrame"/>'s offset and
+        /// sizes it to the frame (scale is the half-size in pixels). The size is left alone when
+        /// the frame's texture cannot be read, since the pixel size is unknown then.
+        /// </summary>
+        private IUndoableCommand MatchRectangleToFrameCommand(AARectSave rectangle, AnimationFrameSave animationFrame)
+        {
+            var size = _pm.GetTextureSizeInPixels(animationFrame.TextureName);
+            float scaleX = size is { } sizeX
+                ? Math.Abs(animationFrame.RightCoordinate - animationFrame.LeftCoordinate) * sizeX.Width / 2f
+                : rectangle.ScaleX;
+            float scaleY = size is { } sizeY
+                ? Math.Abs(animationFrame.BottomCoordinate - animationFrame.TopCoordinate) * sizeY.Height / 2f
+                : rectangle.ScaleY;
+            return SetShapePropsCommand.ForRect(
+                animationFrame, rectangle, rectangle.Name ?? "",
+                animationFrame.RelativeX, animationFrame.RelativeY, scaleX, scaleY,
+                this, _events, $"Match {ShapeUndoLabel.Format(rectangle)} to Frame");
         }
 
         /// <summary>
@@ -839,9 +880,7 @@ namespace AnimationEditor.Core.CommandsAndState
             {
                 var ownerFrame = _objectFinder.GetAnimationFrameContaining(rect);
                 if (ownerFrame is null || IsFrameLocked(ownerFrame)) continue;
-                commands.Add(new MoveShapeCommand(
-                    ownerFrame, rect, rect.X, rect.Y,
-                    ownerFrame.RelativeX, ownerFrame.RelativeY, this, _events));
+                commands.Add(MatchRectangleToFrameCommand(rect, ownerFrame));
             }
             if (commands.Count == 0) return;
 
