@@ -1,4 +1,5 @@
 using AnimationEditor.Core.Data;
+using AnimationEditor.Core.Rendering;
 using FlatRedBall2.AnimationEditorCommon;
 using System.IO;
 using FilePath = AnimationEditor.Core.Paths.FilePath;
@@ -9,7 +10,7 @@ namespace AnimationEditor.Core
     {
         AnimationChainListSave? AnimationChainListSave { get; set; }
         TileMapInformationList TileMapInformationList { get; set; }
-        FilePath[] ReferencedPngs { get; }
+        FilePath[] ReferencedPngs { get; set; }
         string? FileName { get; set; }
 
         /// <summary>
@@ -20,11 +21,97 @@ namespace AnimationEditor.Core
 
         TextureCoordinateType OnDiskCoordinateType { get; set; }
 
+        /// <summary>Whether the currently loaded project is a native <c>.tsx</c> project (see
+        /// <see cref="LoadTsxProject"/>) rather than an achx/achj project.</summary>
+        bool IsNativeTsxProject { get; }
+
+        /// <summary>The tsx's own fixed tile size, or <see langword="null"/> for an achx/achj
+        /// project. Not user-configurable for a native tsx project (issue #1140).</summary>
+        TileGrid? TsxTileGrid { get; }
+
         void LoadAnimationChain(
             FilePath fileName,
             AnimationChainListSave? preParsed = null,
             IReadOnlyDictionary<string, (int Width, int Height)>? knownTextureSizes = null);
         void SaveAnimationChainList(string targetPath);
+
+        /// <summary>Opens <paramref name="fileName"/> as a native AnimationEditor project -- see
+        /// <see cref="ProjectManager.LoadTsxProject"/>.</summary>
+        void LoadTsxProject(FilePath fileName);
+
+        /// <summary>Saves back to the tsx opened by <see cref="LoadTsxProject"/>; no-op (returns
+        /// empty) if none is loaded. Returns every mapping warning from this save (e.g. a chain
+        /// whose frame geometry couldn't be written this time) so a caller can surface them --
+        /// the chain's previously-written tile is left untouched, not cleared, when this is
+        /// non-empty. See <see cref="ProjectManager.SaveTsxProject"/>.</summary>
+        IReadOnlyList<string> SaveTsxProject(string? targetPath = null);
+
+        /// <summary>Names of chains with a tsx validation issue; empty when no tsx project is
+        /// loaded or nothing is wrong. See <see cref="ProjectManager.GetChainNamesWithTsxIssues"/>.</summary>
+        IReadOnlyList<string> GetChainNamesWithTsxIssues();
+
+        /// <summary>The tile id a native-tsx chain's animation would be written to on the next
+        /// save. See <see cref="ProjectManager.GetTsxOwnerTileId"/>.</summary>
+        uint? GetTsxOwnerTileId(AnimationChainSave chain);
+
+        /// <summary>Explicitly overrides which tile id a native-tsx chain's animation is written
+        /// to. See <see cref="ProjectManager.TrySetTsxOwnerTileId"/>.</summary>
+        string? TrySetTsxOwnerTileId(AnimationChainSave chain, uint tileId);
+
+        /// <summary>The Tiled tile id a frame's own pixel rect resolves to. See <see
+        /// cref="ProjectManager.ComputeFrameTileId"/>.</summary>
+        uint? ComputeFrameTileId(AnimationFrameSave frame);
+
+        /// <summary>
+        /// Captures this project's native-tsx state (tileset + tile-id tracking dictionaries) as
+        /// an opaque snapshot, or <see langword="null"/> for an achx/achj project. <see
+        /// cref="AnimationEditor.Core.Models.TabEditorCache"/> uses this to round-trip a tab's tsx
+        /// identity across a cache-hit tab switch (<c>TryActivateTabFromCache</c>) -- that path
+        /// never calls <see cref="LoadTsxProject"/>/<see cref="LoadAnimationChain"/>, so without
+        /// this, <see cref="IsNativeTsxProject"/>/<see cref="TsxTileGrid"/> keep reflecting
+        /// whichever tab was most recently loaded from disk instead of the tab being switched to.
+        /// </summary>
+        object? CaptureTsxState();
+
+        /// <summary>
+        /// Restores a snapshot previously returned by <see cref="CaptureTsxState"/> on this same
+        /// instance, or clears all native-tsx state when <paramref name="state"/> is <see
+        /// langword="null"/> (restoring an achx/achj tab). Passing a snapshot captured from a
+        /// different <see cref="IProjectManager"/> instance is undefined.
+        /// </summary>
+        void RestoreTsxState(object? state);
+
+        /// <summary>
+        /// Captures the texture sizes supplied to the most recent <see cref="LoadAnimationChain"/>
+        /// call as an opaque snapshot, or <see langword="null"/> if none were supplied. Same
+        /// tab-switch-cache shape as <see cref="CaptureTsxState"/>: without this,
+        /// <see cref="AnimationEditor.Core.Models.TabEditorCache"/>'s cache-hit tab switch
+        /// (<c>TryActivateTabFromCache</c>) leaves this project's known texture sizes at
+        /// whichever tab was most recently loaded from disk, so <see
+        /// cref="SaveAnimationChainList(Stream)"/> on the reactivated tab converts back to Pixel
+        /// using the wrong (or missing) sizes on the browser-wasm build, which has no filesystem
+        /// to fall back to.
+        /// </summary>
+        object? CaptureTextureSizeState();
+
+        /// <summary>
+        /// Restores a snapshot previously returned by <see cref="CaptureTextureSizeState"/> on
+        /// this same instance, or clears the known texture sizes when <paramref name="state"/> is
+        /// <see langword="null"/>.
+        /// </summary>
+        void RestoreTextureSizeState(object? state);
+
+        /// <summary>
+        /// Resets this instance to a brand-new, unsaved, non-tsx document: a fresh empty <see
+        /// cref="AnimationChainListSave"/>, <see cref="FileName"/> cleared to <see
+        /// langword="null"/>, <see cref="OnDiskCoordinateType"/> back to its Pixel default, and
+        /// every native-tsx/texture-size/<see cref="ReferencedPngs"/> tracking field cleared (the
+        /// same reset <see cref="RestoreTsxState"/>/<see cref="RestoreTextureSizeState"/> apply
+        /// individually) -- one call instead of repeating that field list at every "start a fresh
+        /// document" call site (issue #1147). Leaves <see cref="ProjectFolderPath"/>, tab/undo/
+        /// selection state untouched; callers own those.
+        /// </summary>
+        void ResetToBlankDocument();
 
         /// <summary>
         /// Stream-based counterpart to <see cref="SaveAnimationChainList(string)"/> for platforms

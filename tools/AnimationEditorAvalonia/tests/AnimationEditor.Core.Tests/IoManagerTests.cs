@@ -168,6 +168,140 @@ public class IoManagerTests
         Assert.Equal(150, loaded?.PreviewZoomPercent);
     }
 
+    // ── Associated Tiled tilesets ─────────────────────────────────────────────
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_NewPath_CreatesTiledSyncFile_DistinctFromAeproperties()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+        var achxPath = dir.Path + "/hero.achx";
+        var tsxPath = dir.Path + "/Heroes.tsx";
+        var expectedTiledSyncPath = dir.Path + "/hero.tiledsync";
+        var expectedAePropsPath = dir.Path + "/hero.aeproperties";
+
+        ctx.IoManager.AddAssociatedTiledTilesetPath(achxPath, tsxPath);
+
+        Assert.True(File.Exists(expectedTiledSyncPath));
+        Assert.False(File.Exists(expectedAePropsPath));
+    }
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_NewPath_TiledSyncFileContainsJson_NotXml()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+        var achxPath = dir.Path + "/hero.achx";
+        var tsxPath = dir.Path + "/Heroes.tsx";
+
+        ctx.IoManager.AddAssociatedTiledTilesetPath(achxPath, tsxPath);
+
+        var contents = File.ReadAllText(dir.Path + "/hero.tiledsync").TrimStart();
+        Assert.StartsWith("{", contents);
+        Assert.DoesNotContain("<TiledTilesetPath>", contents);
+    }
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_NewPath_IsReturnedByGetAssociatedTiledTilesetPaths()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+        Directory.CreateDirectory(dir.Path + "/Tilesets");
+        var achxPath = dir.Path + "/hero.achx";
+        var tsxPath = dir.Path + "/Tilesets/Heroes.tsx";
+
+        ctx.IoManager.AddAssociatedTiledTilesetPath(achxPath, tsxPath);
+        var associated = ctx.IoManager.GetAssociatedTiledTilesetPaths(achxPath);
+
+        Assert.Single(associated);
+        Assert.Equal(new FilePath(tsxPath), new FilePath(associated[0]));
+    }
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_SamePathTwice_IsNotDuplicated()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+        var achxPath = dir.Path + "/hero.achx";
+        var tsxPath = dir.Path + "/Heroes.tsx";
+
+        ctx.IoManager.AddAssociatedTiledTilesetPath(achxPath, tsxPath);
+        ctx.IoManager.AddAssociatedTiledTilesetPath(achxPath, tsxPath);
+
+        Assert.Single(ctx.IoManager.GetAssociatedTiledTilesetPaths(achxPath));
+    }
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_SecondDifferentPath_IsAppendedAlongsideFirst()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+        var achxPath = dir.Path + "/hero.achx";
+        var firstTsxPath = dir.Path + "/Heroes.tsx";
+        var secondTsxPath = dir.Path + "/Enemies.tsx";
+
+        ctx.IoManager.AddAssociatedTiledTilesetPath(achxPath, firstTsxPath);
+        ctx.IoManager.AddAssociatedTiledTilesetPath(achxPath, secondTsxPath);
+        var associated = ctx.IoManager.GetAssociatedTiledTilesetPaths(achxPath);
+
+        Assert.Equal(2, associated.Count);
+        Assert.Contains(new FilePath(firstTsxPath), associated.Select(p => new FilePath(p)));
+        Assert.Contains(new FilePath(secondTsxPath), associated.Select(p => new FilePath(p)));
+    }
+
+    [Fact]
+    public void GetAssociatedTiledTilesetPaths_CorruptTiledSyncFile_RaisesTiledSyncParseFailed()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+        var achxPath = dir.Path + "/hero.achx";
+        File.WriteAllText(dir.Path + "/hero.tiledsync", "{ not valid json");
+
+        (string achxFile, Exception ex)? captured = null;
+        ctx.IoManager.TiledSyncParseFailed += (achxFile, ex) => captured = (achxFile, ex);
+        ctx.IoManager.GetAssociatedTiledTilesetPaths(achxPath);
+
+        Assert.NotNull(captured);
+        Assert.Equal(new FilePath(achxPath), new FilePath(captured!.Value.achxFile));
+    }
+
+    [Fact]
+    public void GetAssociatedTiledTilesetPaths_CorruptTiledSyncFile_ReturnsEmpty()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+        var achxPath = dir.Path + "/hero.achx";
+        File.WriteAllText(dir.Path + "/hero.tiledsync", "{ not valid json");
+
+        var associated = ctx.IoManager.GetAssociatedTiledTilesetPaths(achxPath);
+
+        Assert.Empty(associated);
+    }
+
+    [Fact]
+    public void GetAssociatedTiledTilesetPaths_NoCompanionFile_DoesNotRaiseTiledSyncParseFailed()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+
+        var fired = false;
+        ctx.IoManager.TiledSyncParseFailed += (_, __) => fired = true;
+        ctx.IoManager.GetAssociatedTiledTilesetPaths(dir.Path + "/never-saved.achx");
+
+        Assert.False(fired);
+    }
+
+    [Fact]
+    public void GetAssociatedTiledTilesetPaths_NoCompanionFile_ReturnsEmpty()
+    {
+        var ctx = TestHelpers.SetupFreshAcls();
+        using var dir = new TestHelpers.TempDir();
+
+        var associated = ctx.IoManager.GetAssociatedTiledTilesetPaths(dir.Path + "/never-saved.achx");
+
+        Assert.Empty(associated);
+    }
+
     [Fact]
     public void SaveCompanionFileFor_WhenDirectoryDoesNotExist_FiresSaveFailed()
     {

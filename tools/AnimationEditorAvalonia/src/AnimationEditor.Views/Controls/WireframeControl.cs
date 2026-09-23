@@ -3,6 +3,7 @@ using AnimationEditor.Core.CommandsAndState;
 using AnimationEditor.Core.CommandsAndState.Commands;
 using AnimationEditor.Core.Data;
 using AnimationEditor.Core.Rendering;
+using AnimationEditor.Core.Tiled;
 using AnimationEditor.Core.ViewModels;
 using Avalonia;
 using Avalonia.Controls;
@@ -59,6 +60,9 @@ public class WireframeControl : TextureViewport
         public List<(SKRect Bounds, bool IsSelected, float RevealProgress)> Frames = new();
         /// <summary>Mirrors <see cref="WireframeControl.FillFrames"/> (#976).</summary>
         public bool FillFrames = true;
+        /// <summary>Texture-space rect of each tile cell inside a selected frame on a grid with
+        /// spacing (#1165) -- the pixels Tiled actually draws, gaps excluded.</summary>
+        public List<SKRect> FrameCellBounds = new();
         public SKRect? SelectedHandleBounds;    // null → no handles drawn
         public bool ShowPreview;
         public SKRect PreviewRect;
@@ -85,6 +89,7 @@ public class WireframeControl : TextureViewport
     }
 
     private static readonly SKColor CutOutlineColor = new(224, 112, 48, 220);
+    private static readonly SKColor CellOutlineColor = new(90, 220, 160, 230);
 
     // ── Overlay rendering ─────────────────────────────────────────────────────
 
@@ -127,6 +132,13 @@ public class WireframeControl : TextureViewport
             frameStroke.Color = isSelected ? new SKColor(80, 160, 255, 230) : new SKColor(80, 160, 255, 120);
             canvas.DrawRect(sr, frameStroke);
         }
+
+        // Per-cell outlines inside selected spaced-grid frames (#1165): a second colour so the
+        // strip of gap pixels between cells reads as "inside the frame rect, but not part of any
+        // tile". Drawn after the frame strokes so a 1x1 frame's cell edge sits on top of its own outline.
+        frameStroke.Color = CellOutlineColor;
+        foreach (var bounds in s.FrameCellBounds)
+            canvas.DrawRect(s.TextureRectToScreen(bounds), frameStroke);
 
         // Hover label (#718): a small screen-space notch anchored at the top-left corner of
         // the hovered frame. Fixed pixel font size (never multiplied by s.Zoom) so it reads the
@@ -449,6 +461,69 @@ public class WireframeControl : TextureViewport
     /// </summary>
     private bool IsFrameLocked(AnimationFrameSave frame) =>
         _objectFinder?.GetAnimationChainContaining(frame)?.IsLocked == true;
+
+    /// <summary>
+    /// Records the undo command for a single frame's region change (Move Frame / Resize Frame).
+    /// The single-frame handle-drag and grid/region-resize commit sites all funnel through here
+    /// so the propagation below lives in one place instead of three near-identical copies.
+    /// <para>
+    /// When this is a resize (not just a move) of a frame belonging to a native .tsx project's
+    /// multi-frame chain, also propagates the same per-edge movement onto every sibling frame in
+    /// that chain (matching whichever edge was actually dragged, so growing left/up moves
+    /// siblings left/up too, not just right/down) and records them in the same undo command. See
+    /// <see cref="FrameFootprintSync"/> for why: <c>MultiTileToTiledAnimationMapper</c> requires
+    /// every frame in a chain to share one whole-tile footprint, and silently drops the chain's
+    /// tile animation on save the moment one frame's size disagrees with the rest -- which is
+    /// exactly what stretching only one frame produces otherwise.
+    /// </para>
+    /// </summary>
+    private void RecordFrameRegionChange(
+        AnimationFrameSave frame,
+        float bL, float bT, float bR, float bB,
+        float aL, float aT, float aR, float aB)
+    {
+        bool sizeChanged = FrameFootprintSync.SizeChanged(
+            new FrameFootprintSync.FrameRect(bL, bT, bR, bB), new FrameFootprintSync.FrameRect(aL, aT, aR, aB));
+        var chain = sizeChanged && _projectManager?.IsNativeTsxProject == true
+            ? _objectFinder?.GetAnimationChainContaining(frame)
+            : null;
+
+        if (chain is null || chain.Frames.Count < 2)
+        {
+            _undoManager!.Record(new FrameRegionChangedCommand(
+                frame, bL, bT, bR, bB, aL, aT, aR, aB, _appCommands!, _events!));
+            FrameRegionChanged?.Invoke(frame);
+            return;
+        }
+
+        var siblingMatches = FrameFootprintSync.ComputeSiblingMatches(chain, frame,
+            new FrameFootprintSync.FrameRect(bL, bT, bR, bB),
+            new FrameFootprintSync.FrameRect(aL, aT, aR, aB));
+        var snapshots = new List<BulkFrameRegionChangedCommand.FrameSnapshot>
+        {
+            new(frame, bL, bT, bR, bB, aL, aT, aR, aB),
+        };
+        foreach (var m in siblingMatches)
+        {
+            m.Frame.LeftCoordinate   = m.After.Left;
+            m.Frame.TopCoordinate    = m.After.Top;
+            m.Frame.RightCoordinate  = m.After.Right;
+            m.Frame.BottomCoordinate = m.After.Bottom;
+            snapshots.Add(new(m.Frame,
+                m.Before.Left, m.Before.Top, m.Before.Right, m.Before.Bottom,
+                m.After.Left,  m.After.Top,  m.After.Right,  m.After.Bottom));
+        }
+
+        _undoManager!.Record(new BulkFrameRegionChangedCommand(snapshots, _appCommands!, _events!));
+        // Fire for the dragged frame only after every sibling above has already been resized to
+        // match -- this is the one event that triggers autosave (see MainWindow.OnFrameRegionChanged),
+        // and firing it any earlier lets a save observe the dragged frame's new size while its
+        // siblings still have the old one, tripping MultiTileToTiledAnimationMapper's
+        // footprint-mismatch check on a resize that is actually being applied correctly.
+        FrameRegionChanged?.Invoke(frame);
+        foreach (var m in siblingMatches)
+            FrameRegionChanged?.Invoke(m.Frame);
+    }
 
     /// <summary>
     /// Called from MainWindow after DI container wires all services.
@@ -817,11 +892,10 @@ public class WireframeControl : TextureViewport
     /// </summary>
     public void SimulateGridSnapClick(float screenX, float screenY)
     {
-        if (_bitmap is null || !_showGrid || _gridSize <= 0) return;
+        if (_bitmap is null || !_showGrid || !_grid.IsValid) return;
         var world = ScreenToTexture(screenX, screenY);
-        int gx = GridSnapper.Snap(world.X, _gridSize);
-        int gy = GridSnapper.Snap(world.Y, _gridSize);
-        FrameCreatedFromRegion?.Invoke(gx, gy, gx + _gridSize, gy + _gridSize);
+        var (gx, gy, gr, gb) = GridPlacementCalculator.SnapToCell(world.X, world.Y, _grid);
+        FrameCreatedFromRegion?.Invoke(gx, gy, gr, gb);
     }
 
     /// <summary>
@@ -833,7 +907,7 @@ public class WireframeControl : TextureViewport
     /// </summary>
     public void SimulateGridSnapDoubleClick(float screenX, float screenY)
     {
-        if (_bitmap is null || !_showGrid || _gridSize <= 0) return;
+        if (_bitmap is null || !_showGrid || !_grid.IsValid) return;
         var world = ScreenToTexture(screenX, screenY);
         SnapSelectedFrameToGridCell(world.X, world.Y);
     }
@@ -847,7 +921,7 @@ public class WireframeControl : TextureViewport
     /// </summary>
     public void SimulateGridPlainClick(float screenX, float screenY)
     {
-        if (_bitmap is null || !_showGrid || _gridSize <= 0) return;
+        if (_bitmap is null || !_showGrid || !_grid.IsValid) return;
         var world = ScreenToTexture(screenX, screenY);
         TrySelectFrameAtPoint(world);
     }
@@ -896,12 +970,11 @@ public class WireframeControl : TextureViewport
         float aR = sel.Frame.RightCoordinate, aB = sel.Frame.BottomCoordinate;
         if (RegionChanged(_dragBeforeL, _dragBeforeT, _dragBeforeR, _dragBeforeB, aL, aT, aR, aB))
         {
-            FrameRegionChanged?.Invoke(sel.Frame);
-            _undoManager!.Record(new FrameRegionChangedCommand(
-                sel.Frame,
+            // RecordFrameRegionChange raises FrameRegionChanged itself, once sibling frames (if
+            // any) are already synced -- see its remarks.
+            RecordFrameRegionChange(sel.Frame,
                 _dragBeforeL, _dragBeforeT, _dragBeforeR, _dragBeforeB,
-                aL, aT, aR, aB,
-                _appCommands!, _events!));
+                aL, aT, aR, aB);
         }
         _draggingRect   = null;
         _draggingHandle = HandleKind.None;
@@ -944,21 +1017,7 @@ public class WireframeControl : TextureViewport
 
         ApplyHandleDrag(new Point(endScreenX, endScreenY));
 
-        var snapshots = _bulkHandleDragStarts
-            .Select(s => new BulkFrameRegionChangedCommand.FrameSnapshot(
-                s.Rect.Frame,
-                s.BL, s.BT, s.BR, s.BB,
-                s.Rect.Frame.LeftCoordinate, s.Rect.Frame.TopCoordinate,
-                s.Rect.Frame.RightCoordinate, s.Rect.Frame.BottomCoordinate))
-            .ToList();
-        if (snapshots.Any(s => RegionChanged(s.BL, s.BT, s.BR, s.BB, s.AL, s.AT, s.AR, s.AB)))
-        {
-            _undoManager!.Record(new BulkFrameRegionChangedCommand(snapshots, _appCommands!, _events!));
-            foreach (var (fr, _, _, _, _, _) in _bulkHandleDragStarts)
-                FrameRegionChanged?.Invoke(fr.Frame);
-        }
-
-        _bulkHandleDragStarts.Clear();
+        CommitBulkHandleDrag();
         _draggingRect   = null;
         _draggingHandle = HandleKind.None;
     }
@@ -1245,6 +1304,17 @@ public class WireframeControl : TextureViewport
         foreach (var fr in _frameRects)
             snap.Frames.Add((fr.Bounds, fr.IsSelected, GetSelectionRevealProgress(fr.Frame)));
 
+        // Cell outlines inside each SELECTED frame (issue #1165): on a grid with spacing, a
+        // multi-cell frame's rect includes the gap pixels between its cells, which Tiled never
+        // draws. Outlining each cell shows exactly what will animate; the outer rect keeps its
+        // handles so editing is unchanged. Selected only -- on every frame of a big sheet it's
+        // noise. Unaligned rects (mid-edit) get no outlines.
+        if (_showGrid && _grid.Spacing > 0)
+            foreach (var fr in _frameRects)
+                if (fr.IsSelected)
+                    foreach (var cell in _grid.FrameCells(fr.Bounds.Left, fr.Bounds.Top, fr.Bounds.Width, fr.Bounds.Height))
+                        snap.FrameCellBounds.Add(new SKRect(cell.Left, cell.Top, cell.Right, cell.Bottom));
+
         if (_hoverFrame != null)
         {
             snap.HoverFrameBounds = _hoverFrame.Bounds;
@@ -1303,7 +1373,7 @@ public class WireframeControl : TextureViewport
         // Grid mode double-click: bypass handle hit-testing so that a frame covering
         // the entire texture (which would otherwise always hit HandleKind.Move) can still
         // have a specific grid cell applied to it.
-        if (!isCtrl && !_isMagicWandMode && e.ClickCount == 2 && _showGrid && _gridSize > 0 && _bitmap != null)
+        if (!isCtrl && !_isMagicWandMode && e.ClickCount == 2 && _showGrid && _grid.IsValid && _bitmap != null)
         {
             var dblWorld = ScreenToTexture((float)pos.X, (float)pos.Y);
             SnapSelectedFrameToGridCell(dblWorld.X, dblWorld.Y);
@@ -1405,13 +1475,12 @@ public class WireframeControl : TextureViewport
         //    select the frame under the cursor, same as plain mode. Resizing/repositioning
         //    the selected frame onto a grid cell is an explicit gesture (double-click,
         //    issue #363/#895) — a plain click must never silently move or resize it.
-        if (_showGrid && _gridSize > 0)
+        if (_showGrid && _grid.IsValid)
         {
             if (isCtrl)
             {
-                int gx = GridSnapper.Snap(world.X, _gridSize);
-                int gy = GridSnapper.Snap(world.Y, _gridSize);
-                FrameCreatedFromRegion?.Invoke(gx, gy, gx + _gridSize, gy + _gridSize);
+                var (gx, gy, gr, gb) = GridPlacementCalculator.SnapToCell(world.X, world.Y, _grid);
+                FrameCreatedFromRegion?.Invoke(gx, gy, gr, gb);
             }
             else
                 TrySelectFrameAtPoint(world);
@@ -1604,6 +1673,51 @@ public class WireframeControl : TextureViewport
     }
 
     /// <summary>
+    /// Commits a bulk handle drag: one atomic undo command covering every dragged frame, then a
+    /// region-changed event per frame. In a native .tsx project, any chain whose dragged frames
+    /// changed size also gets its un-dragged frames matched to the new footprint, recorded in the
+    /// same command -- the bulk sibling of <see cref="RecordFrameRegionChange"/>'s propagation,
+    /// for a selection that mixes chain nodes with individual frames. Clears
+    /// <see cref="_bulkHandleDragStarts"/>.
+    /// </summary>
+    private void CommitBulkHandleDrag()
+    {
+        var snapshots = _bulkHandleDragStarts
+            .Select(s => new BulkFrameRegionChangedCommand.FrameSnapshot(
+                s.Rect.Frame,
+                s.BL, s.BT, s.BR, s.BB,
+                s.Rect.Frame.LeftCoordinate, s.Rect.Frame.TopCoordinate,
+                s.Rect.Frame.RightCoordinate, s.Rect.Frame.BottomCoordinate))
+            .ToList();
+        if (snapshots.Any(s => RegionChanged(s.BL, s.BT, s.BR, s.BB, s.AL, s.AT, s.AR, s.AB)))
+        {
+            if (_projectManager?.IsNativeTsxProject == true && _objectFinder != null)
+            {
+                var siblingMatches = FrameFootprintSync.ComputeSiblingMatches(
+                    snapshots.Select(s => (s.Frame,
+                        new FrameFootprintSync.FrameRect(s.BL, s.BT, s.BR, s.BB),
+                        new FrameFootprintSync.FrameRect(s.AL, s.AT, s.AR, s.AB))).ToList(),
+                    _objectFinder.GetAnimationChainContaining);
+                foreach (var m in siblingMatches)
+                {
+                    m.Frame.LeftCoordinate   = m.After.Left;
+                    m.Frame.TopCoordinate    = m.After.Top;
+                    m.Frame.RightCoordinate  = m.After.Right;
+                    m.Frame.BottomCoordinate = m.After.Bottom;
+                    snapshots.Add(new(m.Frame,
+                        m.Before.Left, m.Before.Top, m.Before.Right, m.Before.Bottom,
+                        m.After.Left,  m.After.Top,  m.After.Right,  m.After.Bottom));
+                }
+            }
+
+            _undoManager!.Record(new BulkFrameRegionChangedCommand(snapshots, _appCommands!, _events!));
+            foreach (var s in snapshots)
+                FrameRegionChanged?.Invoke(s.Frame);
+        }
+        _bulkHandleDragStarts.Clear();
+    }
+
+    /// <summary>
     /// Commits the in-progress handle or chain drag (undo + region-changed events) and clears
     /// drag state. Shared by <see cref="OnEditPointerReleased"/> and
     /// <see cref="OnPointerCaptureLost"/> so both paths leave the control idle.
@@ -1613,24 +1727,7 @@ public class WireframeControl : TextureViewport
         if (_draggingRect != null)
         {
             if (_bulkHandleDragStarts.Count > 0)
-            {
-                // Bulk drag: record one atomic undo command covering all affected frames,
-                // then notify listeners for each changed frame.
-                var snapshots = _bulkHandleDragStarts
-                    .Select(s => new BulkFrameRegionChangedCommand.FrameSnapshot(
-                        s.Rect.Frame,
-                        s.BL, s.BT, s.BR, s.BB,
-                        s.Rect.Frame.LeftCoordinate, s.Rect.Frame.TopCoordinate,
-                        s.Rect.Frame.RightCoordinate, s.Rect.Frame.BottomCoordinate))
-                    .ToList();
-                if (snapshots.Any(s => RegionChanged(s.BL, s.BT, s.BR, s.BB, s.AL, s.AT, s.AR, s.AB)))
-                {
-                    _undoManager!.Record(new BulkFrameRegionChangedCommand(snapshots, _appCommands!, _events!));
-                    foreach (var (fr, _, _, _, _, _) in _bulkHandleDragStarts)
-                        FrameRegionChanged?.Invoke(fr.Frame);
-                }
-                _bulkHandleDragStarts.Clear();
-            }
+                CommitBulkHandleDrag();
             else
             {
                 float aL = _draggingRect.Frame.LeftCoordinate;
@@ -1642,12 +1739,11 @@ public class WireframeControl : TextureViewport
                 if (!IsFrameLocked(_draggingRect.Frame) &&
                     RegionChanged(_dragBeforeL, _dragBeforeT, _dragBeforeR, _dragBeforeB, aL, aT, aR, aB))
                 {
-                    FrameRegionChanged?.Invoke(_draggingRect.Frame);
-                    _undoManager!.Record(new FrameRegionChangedCommand(
-                        _draggingRect.Frame,
+                    // RecordFrameRegionChange raises FrameRegionChanged itself, once sibling
+                    // frames (if any) are already synced -- see its remarks.
+                    RecordFrameRegionChange(_draggingRect.Frame,
                         _dragBeforeL, _dragBeforeT, _dragBeforeR, _dragBeforeB,
-                        aL, aT, aR, aB,
-                        _appCommands!, _events!));
+                        aL, aT, aR, aB);
                 }
             }
             _draggingRect = null;
@@ -1709,9 +1805,9 @@ public class WireframeControl : TextureViewport
 
         var nb = DragHandleApplier.Apply(_draggingHandle, dx, dy, startBounds);
 
-        // Always snap to integer pixel; upgrade to grid-size snap when the grid is on.
-        int snapSize = (_showGrid && _gridSize > 0) ? _gridSize : 1;
-        nb = DragHandleApplier.SnapEdges(nb, _draggingHandle, snapSize);
+        // Always snap to integer pixel; upgrade to grid snap when the grid is on.
+        var snapGrid = (_showGrid && _grid.IsValid) ? _grid : TileGrid.Uniform(1);
+        nb = DragHandleApplier.SnapEdges(nb, _draggingHandle, snapGrid);
 
         _draggingRect.Bounds = new SKRect(nb.Left, nb.Top, nb.Right, nb.Bottom);
 
@@ -1732,7 +1828,7 @@ public class WireframeControl : TextureViewport
                 if (fr == _draggingRect) continue;
                 var sb = new BoundsRect(startB.Left, startB.Top, startB.Right, startB.Bottom);
                 var nb2 = DragHandleApplier.Apply(_draggingHandle, dx, dy, sb);
-                nb2 = DragHandleApplier.SnapEdges(nb2, _draggingHandle, snapSize);
+                nb2 = DragHandleApplier.SnapEdges(nb2, _draggingHandle, snapGrid);
                 fr.Bounds = new SKRect(nb2.Left, nb2.Top, nb2.Right, nb2.Bottom);
                 var (l2, t2, r2, b2) = DragHandleApplier.ToUvCoords(nb2, texW, texH);
                 fr.Frame.LeftCoordinate   = l2;
@@ -1755,10 +1851,11 @@ public class WireframeControl : TextureViewport
         float dx = world.X - _dragStartWorld.X;
         float dy = world.Y - _dragStartWorld.Y;
 
-        // Snap to integer pixel; upgrade to grid-size snap when the grid is on.
-        int snapSize = (_showGrid && _gridSize > 0) ? _gridSize : 1;
-        dx = MathF.Round(dx / snapSize) * snapSize;
-        dy = MathF.Round(dy / snapSize) * snapSize;
+        // Snap to integer pixel; upgrade to a whole-cell stride (cell + spacing) when the grid is
+        // on, so a grid-aligned chain stays grid-aligned.
+        var snapGrid = (_showGrid && _grid.IsValid) ? _grid : TileGrid.Uniform(1);
+        dx = MathF.Round(dx / snapGrid.StrideX) * snapGrid.StrideX;
+        dy = MathF.Round(dy / snapGrid.StrideY) * snapGrid.StrideY;
 
         float texW = _bitmap.Width;
         float texH = _bitmap.Height;
@@ -1911,12 +2008,17 @@ public class WireframeControl : TextureViewport
         frame.TopCoordinate    = aT;
         frame.BottomCoordinate = aB;
         RefreshFramesInternal();
-        FrameRegionChanged?.Invoke(frame);
 
+        // RecordFrameRegionChange raises FrameRegionChanged itself, once sibling frames (if any)
+        // are already synced -- see its remarks. Raising it here first would let the autosave it
+        // triggers observe this frame's new size before its siblings have caught up.
         if (RegionChanged(bL, bT, bR, bB, aL, aT, aR, aB))
         {
-            _undoManager!.Record(new FrameRegionChangedCommand(
-                frame, bL, bT, bR, bB, aL, aT, aR, aB, _appCommands!, _events!));
+            RecordFrameRegionChange(frame, bL, bT, bR, bB, aL, aT, aR, aB);
+        }
+        else
+        {
+            FrameRegionChanged?.Invoke(frame);
         }
     }
 
@@ -1932,7 +2034,7 @@ public class WireframeControl : TextureViewport
     private void SnapSelectedFrameToGridCell(float worldX, float worldY)
     {
         if (_selectedState!.SelectedFrame is null || _bitmap is null) return;
-        var (minX, minY, maxX, maxY) = GridPlacementCalculator.SnapToCell(worldX, worldY, _gridSize);
+        var (minX, minY, maxX, maxY) = GridPlacementCalculator.SnapToCell(worldX, worldY, _grid);
         ApplyRegionToSelectedFrame(minX, minY, maxX, maxY);
     }
 

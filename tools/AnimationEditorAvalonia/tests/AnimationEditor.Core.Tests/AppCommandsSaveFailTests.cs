@@ -1,6 +1,7 @@
 using AnimationEditor.Core.CommandsAndState;
 using AnimationEditor.Core.CommandsAndState.Commands;
 using AnimationEditor.Core.Data;
+using AnimationEditor.Core.Rendering;
 using AnimationEditor.Core.IO;
 using AnimationEditor.Core.Paths;
 using FlatRedBall2.AnimationEditorCommon;
@@ -65,10 +66,23 @@ public class AppCommandsSaveFailTests
     {
         public AnimationChainListSave? AnimationChainListSave { get; set; }
         public TileMapInformationList TileMapInformationList { get; set; } = new();
-        public FilePath[] ReferencedPngs => Array.Empty<FilePath>();
+        public FilePath[] ReferencedPngs { get; set; } = Array.Empty<FilePath>();
         public string? FileName { get; set; }
         public string? ProjectFolderPath { get; set; }
         public TextureCoordinateType OnDiskCoordinateType { get; set; }
+        public bool IsNativeTsxProject => false;
+        public TileGrid? TsxTileGrid => null;
+        public void LoadTsxProject(FilePath fileName) { }
+        public IReadOnlyList<string> SaveTsxProject(string? targetPath = null) => [];
+        public IReadOnlyList<string> GetChainNamesWithTsxIssues() => Array.Empty<string>();
+        public uint? GetTsxOwnerTileId(AnimationChainSave chain) => null;
+        public string? TrySetTsxOwnerTileId(AnimationChainSave chain, uint tileId) => "not a tsx project";
+        public uint? ComputeFrameTileId(AnimationFrameSave frame) => null;
+        public object? CaptureTsxState() => null;
+        public void RestoreTsxState(object? state) { }
+        public object? CaptureTextureSizeState() => null;
+        public void RestoreTextureSizeState(object? state) { }
+        public void ResetToBlankDocument() { }
 
         public void LoadAnimationChain(
             FilePath fileName,

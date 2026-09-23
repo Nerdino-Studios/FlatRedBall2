@@ -1,17 +1,27 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             x:Class="AnimationEditor.Views.Controls.EditorNotificationOverlay"
-             IsHitTestVisible="False">
+             x:Class="AnimationEditor.Views.Controls.EditorNotificationOverlay">
     <!--
         Phase 15: item-deleted undo toast, generic status toast, and error banner lifted from
         desktop MainWindow.axaml overlays so the browser build can host them without duplicating
-        timer/dismiss logic. IsHitTestVisible=False on the root so hidden overlays never block
-        the editor; each visible panel re-enables hit-testing on itself.
+        timer/dismiss logic.
+
+        #1130 follow-up: this root UserControl (and the Panel below it) used to carry
+        IsHitTestVisible="False", on the theory that each panel's own IsHitTestVisible="True"
+        would "re-enable" hit-testing for itself. It doesn't: Avalonia's hit-test walk prunes an
+        element's entire subtree once an ancestor is IsHitTestVisible=False, so none of
+        ToastDismissBtn/ToastRetryBtn/ErrorBannerDismissBtn/ItemDeletedToastUndoBtn were ever
+        reachable by a real pointer click (confirmed by simulating a click at the actual button
+        bounds in a headless test; it did nothing until this was removed). The "pass clicks
+        through when nothing is shown" goal this was trying to achieve doesn't need it anyway:
+        neither the UserControl nor the Panel sets a Background, and an element with no Background
+        brush is already excluded from hit-testing on its own account, so empty overlay space was
+        always click-through. Each Border's own IsVisible="False" default (not IsHitTestVisible)
+        is what keeps a hidden panel out of the way.
     -->
     <Panel>
         <Border x:Name="ItemDeletedToastPanel" x:FieldModifier="Public"
                 IsVisible="False"
-                IsHitTestVisible="True"
                 HorizontalAlignment="Center"
                 VerticalAlignment="Bottom"
                 Margin="0,0,0,30"
@@ -33,7 +43,6 @@
 
         <Border x:Name="ErrorBanner" x:FieldModifier="Public"
                 IsVisible="False"
-                IsHitTestVisible="True"
                 HorizontalAlignment="Center"
                 VerticalAlignment="Top"
                 Margin="0,16,0,0"
@@ -45,15 +54,21 @@
                 Padding="14,10"
                 ZIndex="60">
             <DockPanel>
+                <!-- #1130 follow-up: a Path icon, not a Unicode "✕" glyph; see ToastDismissBtn's
+                     comment below for why. -->
                 <Button x:Name="ErrorBannerDismissBtn" x:FieldModifier="Public"
                         DockPanel.Dock="Right"
-                        Content="✕"
                         Width="24" Height="22"
                         Margin="10,0,0,0"
                         Padding="0" BorderThickness="0"
                         Background="Transparent"
-                        Foreground="#E8B0A8"
-                        VerticalAlignment="Top" />
+                        HorizontalContentAlignment="Center"
+                        VerticalContentAlignment="Center"
+                        VerticalAlignment="Top">
+                    <Path Width="10" Height="10" Stretch="Uniform"
+                          Fill="#E8B0A8"
+                          Data="M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z" />
+                </Button>
                 <TextBlock DockPanel.Dock="Left"
                            Text="⚠"
                            FontSize="15"
@@ -68,38 +83,77 @@
             </DockPanel>
         </Border>
 
+        <!-- #1130: floating top-right card instead of a bottom chrome-colored bar, so a
+             confirmation reads like a phone/desktop notification instead of blending into the
+             window rail. ZIndex above ErrorBanner (60) since this is the most frequent overlay
+             and must never end up hidden behind it; top-right (not ErrorBanner's top-center)
+             so the two never occupy the same screen region if both are visible at once.
+             InfoBannerBg + AccentCool left stripe reuses MainWindow's existing "tier-2
+             actionable info" styling (see DefaultHandlerBanner) instead of inventing a new
+             color language, while staying distinct from ErrorBanner's red and
+             ItemDeletedToastPanel's plain #333.
+
+             Top margin (44) clears MainWindow's 36px custom title bar (WindowDecorations="None"
+             means Minimize/Maximize/CloseBtn are ordinary in-tree controls at the top-right
+             corner, not native OS chrome the overlay can't reach). This overlay auto-hides on a
+             timer, so a user's click can land after the panel has vanished; if any part of it
+             sat over CloseBtn, that stray click would close the whole app instead of hitting
+             nothing. See ToastCloseButtonOverlapTests. -->
         <Border x:Name="ToastPanel" x:FieldModifier="Public"
                 IsVisible="False"
-                IsHitTestVisible="True"
-                VerticalAlignment="Bottom"
-                HorizontalAlignment="Stretch"
-                Margin="0,0,0,22"
-                Background="{DynamicResource BgRail}"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Margin="0,44,16,0"
+                MaxWidth="420"
+                Background="{DynamicResource InfoBannerBg}"
                 BorderBrush="{DynamicResource LineBrush}"
-                BorderThickness="0,1,0,0"
-                Height="36"
-                ZIndex="10">
-            <DockPanel Margin="16,0">
-                <Button x:Name="ToastDismissBtn" x:FieldModifier="Public"
-                        DockPanel.Dock="Right"
-                        Content="✕"
-                        Width="28" Height="22"
-                        Padding="0" BorderThickness="0"
-                        Background="Transparent"
-                        Foreground="{DynamicResource InkMid}"
-                        VerticalAlignment="Center" />
-                <Button x:Name="ToastRetryBtn" x:FieldModifier="Public"
-                        DockPanel.Dock="Right"
-                        Content="Retry"
-                        Height="22"
-                        Padding="8,0"
-                        Margin="0,0,4,0"
-                        VerticalAlignment="Center" />
-                <TextBlock x:Name="ToastMessage" x:FieldModifier="Public"
-                           VerticalAlignment="Center"
-                           FontSize="11"
-                           Foreground="{DynamicResource InkMid}"
-                           TextTrimming="CharacterEllipsis" />
+                BorderThickness="1"
+                CornerRadius="6"
+                BoxShadow="0 4 16 0 #4D000000"
+                ZIndex="70">
+            <DockPanel>
+                <Border DockPanel.Dock="Left"
+                        Width="3"
+                        Background="{DynamicResource AccentCool}" />
+                <DockPanel Margin="10,8">
+                    <!-- #1130 follow-up: Content="✕" (the Unicode MULTIPLICATION X glyph) rendered
+                         visibly off-center in this button's 28x22 box; the visible ink sat left
+                         of the TextBlock's own (correctly centered) layout bounds, with empty
+                         space on the right, even with HorizontalContentAlignment/
+                         VerticalContentAlignment explicitly set to Center. Root cause: this app's
+                         "Inter" font has no glyph for U+2715, so it silently falls back to the
+                         system font for just that character, and the fallback glyph's advance
+                         width doesn't match its visible ink width; most visible on this button's
+                         small, tight box (MainWindow's CloseBtn uses the same glyph and the same
+                         font fallback, but its much larger 46x36 box hides the same absolute pixel
+                         offset). A Path with our own geometry has no font/fallback involved, so its
+                         bounds are exactly its visible ink, so it centers correctly regardless of
+                         box size. See NotificationDismissGlyphCenteredTests. -->
+                    <Button x:Name="ToastDismissBtn" x:FieldModifier="Public"
+                            DockPanel.Dock="Right"
+                            Width="28" Height="22"
+                            Padding="0" BorderThickness="0"
+                            Background="Transparent"
+                            HorizontalContentAlignment="Center"
+                            VerticalContentAlignment="Center"
+                            VerticalAlignment="Top">
+                        <Path Width="10" Height="10" Stretch="Uniform"
+                              Fill="{DynamicResource InkMid}"
+                              Data="M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z" />
+                    </Button>
+                    <Button x:Name="ToastRetryBtn" x:FieldModifier="Public"
+                            DockPanel.Dock="Right"
+                            Content="Retry"
+                            Height="22"
+                            Padding="8,0"
+                            Margin="0,0,4,0"
+                            VerticalAlignment="Top" />
+                    <TextBlock x:Name="ToastMessage" x:FieldModifier="Public"
+                               VerticalAlignment="Center"
+                               FontSize="12"
+                               Foreground="{DynamicResource Ink}"
+                               TextWrapping="Wrap" />
+                </DockPanel>
             </DockPanel>
         </Border>
     </Panel>

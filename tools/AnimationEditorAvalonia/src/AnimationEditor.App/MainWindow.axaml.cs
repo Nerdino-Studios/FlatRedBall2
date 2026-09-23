@@ -58,14 +58,13 @@ public partial class MainWindow : Window
     private readonly ProjectTreeThumbnailService _projectTreeThumbnailService;
     private readonly IFileAssociationService _fileAssociation;
     private readonly IApplicationUpdater _applicationUpdater;
-    private readonly ITiledExtensionInstaller _tiledExtensionInstaller;
     private readonly IEditorDialogHost _dialogHost;
     private readonly FolderWatcher _pngFolderWatcher = new(PngFolderScanner.IsPngPath);
 
-    // Watches the Open Project Folder tree for .achx changes that never went through an open tab
-    // (#843) -- e.g. a git pull or another editor touching a file the user never clicked. The
-    // active tab's own .achx/PNGs are already covered by _appCommands.HotReloadWatcher.
-    private readonly FolderWatcher _projectFolderWatcher = new(AchxFolderScanner.IsAchxPath);
+    // Watches the Open Project Folder tree for .achx/.achj/.tsx changes that never went through an
+    // open tab (#843) -- e.g. a git pull or another editor touching a file the user never clicked.
+    // The active tab's own .achx/PNGs are already covered by _appCommands.HotReloadWatcher.
+    private readonly FolderWatcher _projectFolderWatcher = new(AchxFolderScanner.IsProjectTreePath);
 
     /// <summary>
     /// Completes once the most recent <see cref="IAppCommands.EditorProjectModelChanged"/>
@@ -189,6 +188,12 @@ public partial class MainWindow : Window
     private bool _isApplyingShiftRangeSelection;
     private readonly AltMenuActivationSuppressor _altMenuActivationSuppressor = new();
 
+    // Coalesces a multi-row tree-selection gesture (Shift/Ctrl+Click range, Shift+Arrow
+    // extension) that fires Avalonia's SelectionChanged once per row into a leading-edge
+    // (immediate) sync plus at most one trailing catch-up sync -- see OnTreeSelectionChanged.
+    private bool _treeSelectionBurstActive;
+    private TreeNodeVm? _pendingTreeSelectionVm;
+
     // The platform application-data root under which settings live. Injected (not read from
     // Environment here) so headless tests can redirect it to a temp dir and never touch the
     // developer's real %APPDATA%\AnimationEditor\AESettings.json (see issue #438).
@@ -214,8 +219,7 @@ public partial class MainWindow : Window
         ProjectTreeThumbnailService projectTreeThumbnailService,
         IFileAssociationService fileAssociation,
         string applicationDataRoot,
-        IApplicationUpdater? applicationUpdater = null,
-        ITiledExtensionInstaller? tiledExtensionInstaller = null)
+        IApplicationUpdater? applicationUpdater = null)
     {
         _applicationDataRoot = applicationDataRoot;
 
@@ -232,7 +236,6 @@ public partial class MainWindow : Window
         _projectTreeThumbnailService = projectTreeThumbnailService;
         _fileAssociation = fileAssociation;
         _applicationUpdater = applicationUpdater ?? new NoOpApplicationUpdater();
-        _tiledExtensionInstaller = tiledExtensionInstaller ?? new TiledExtensionInstaller();
         _dialogHost = new WindowEditorDialogHost(this);
         // Desktop renders the tree with its own _treeRoots collection, so the controller
         // reads expand state from there (browser reads its AnimationTreeControl instead).
@@ -251,6 +254,7 @@ public partial class MainWindow : Window
         ApplyPersistedTheme();
         ApplyPersistedCanvasColors();
         ApplyPersistedPreviewPaneHeight();
+        ApplyPersistedSidebarWidth();
         ApplyPersistedWindowState();
         WireMenuEvents();
         WireWireframeToolbar();
@@ -269,7 +273,6 @@ public partial class MainWindow : Window
         WireDefaultHandlerBanner();
         WireRecoveredDocumentBanner();
         WireUpdateAvailableBanner();
-        WireTiledInstallBanner();
 
         WireframeCtrl.InitializeServices(_selectedState, _appState, _appCommands, _events, _projectManager, _undoManager, _pendingCutState, _objectFinder, msg => ShowStatusMessage(msg, isError: true));
         PreviewCtrl.InitializeServices(_selectedState, _appState, _appCommands, _events, _projectManager, _undoManager, _thumbnailService, _pendingCutState, msg => ShowStatusMessage(msg, isError: true));
@@ -329,6 +332,7 @@ public partial class MainWindow : Window
         {
             // Piggyback on SaveTabsToSettings' write rather than a separate SaveSettingsFile call.
             _appSettings.PreviewPaneHeight = AchxEditorPane.RowDefinitions[3].Height.Value;
+            _appSettings.SidebarWidth = MainContentGrid.ColumnDefinitions[0].Width.Value;
             _appSettings.WindowMaximized = WindowState == WindowState.Maximized;
             SaveTabsToSettings();
             // A normal close is not a crash -- clear any stray recovery file so the next
@@ -781,10 +785,13 @@ public partial class MainWindow : Window
 
     private void ActivateUntitledTabContent(TabEntry tab)
     {
+        // ResetToBlankDocument (#1147) clears any native-tsx/texture-size/ReferencedPngs state
+        // the previously-active tab left behind -- an untitled tab is never a tsx project, so
+        // switching to one must not keep reporting IsNativeTsxProject true.
+        _projectManager.ResetToBlankDocument();
         // See the comment in ActivateTabAsync (#1026) -- a pending cut survives this switch too.
-        _projectManager.AnimationChainListSave =
-            tab.CachedEditorModel ?? new AnimationChainListSave();
-        _projectManager.FileName = null;
+        if (tab.CachedEditorModel is not null)
+            _projectManager.AnimationChainListSave = tab.CachedEditorModel;
         _appCommands.RestoreTabSelection(tab);
         _undoManager.Clear();
         if (tab.UndoSnapshot != null)
@@ -910,10 +917,10 @@ public partial class MainWindow : Window
         }
         else
         {
-            // All tabs closed — start fresh
+            // All tabs closed — start fresh. ResetToBlankDocument (#1147) also clears any
+            // native-tsx/texture-size/ReferencedPngs state the just-closed tab left behind.
             ShowAchxPane();
-            _projectManager.AnimationChainListSave = new AnimationChainListSave();
-            _projectManager.FileName = null;
+            _projectManager.ResetToBlankDocument();
             _selectedState.Reset();
             _undoManager.Clear();
             ProjectPanel.SyncSelectionToActiveFile(null);
@@ -967,7 +974,7 @@ public partial class MainWindow : Window
             if (active.Kind == TabKind.Png)
                 ShowPngPane(active);
             else
-                await _appCommands.OpenAchxWorkflowAsync(active.Path.FullPath);
+                await _appCommands.OpenProjectWorkflowAsync(active.Path.FullPath);
             RebuildTabStrip();
         }
     }
@@ -1009,8 +1016,7 @@ public partial class MainWindow : Window
         }
         else if (recovered is null)
         {
-            _projectManager.AnimationChainListSave =
-                new AnimationChainListSave();
+            _projectManager.AnimationChainListSave = new AnimationChainListSave();
         }
 
         if (recovered is not null)
@@ -1039,11 +1045,6 @@ public partial class MainWindow : Window
         // default" / "Don't show again" controls in Settings still work for anyone who
         // wants to try it.
         _ = RunStartupUpdateDownloadAsync();
-
-        // Unlike the default-handler banner above, installing the Tiled extension is a plain
-        // file copy that works today (no installer/distribution blocker), so this one is shown
-        // automatically (#1128).
-        ShowTiledInstallBannerIfAppropriate();
     }
 
     /// <summary>
@@ -1112,113 +1113,6 @@ public partial class MainWindow : Window
         }
     }
 
-    // ── Tiled-extension install banner (issue #1128) ──────────────────────────
-
-    private void WireTiledInstallBanner()
-    {
-        InstallTiledExtensionBtn.Click += (_, _) => InstallTiledExtensionFromBanner();
-
-        RemindLaterTiledInstallBtn.Click += (_, _) => TiledInstallBanner.IsVisible = false;
-
-        DismissTiledInstallBtn.Click += (_, _) =>
-        {
-            _appSettings.SuppressTiledInstallPrompt = true;
-            SaveSettingsFile();
-            TiledInstallBanner.IsVisible = false;
-        };
-    }
-
-    /// <summary>
-    /// A remembered manual pick (<see cref="AppSettingsModel.TiledExtensionsFolderOverride"/>)
-    /// only matters once auto-detection fails -- if Tiled's well-known folder is now detected
-    /// (e.g. Tiled was installed since the user last picked a folder by hand), that live result
-    /// always wins.
-    /// </summary>
-    private string? ResolveTiledExtensionsFolder() =>
-        _tiledExtensionInstaller.DetectExtensionsFolder() ?? _appSettings.TiledExtensionsFolderOverride;
-
-    private void ShowTiledInstallBannerIfAppropriate()
-    {
-        string? folder = ResolveTiledExtensionsFolder();
-        var status = folder is null
-            ? TiledExtensionInstallStatus.NotDetected
-            : _tiledExtensionInstaller.GetStatus(folder);
-
-        if (TiledExtensionInstallPromptDecider.ShouldPrompt(
-                tiledDetected: folder is not null, status, _appSettings.SuppressTiledInstallPrompt))
-        {
-            TiledInstallBannerText.Text =
-                $"Tiled was detected on this machine. Install the FlatRedBall2 .achj import extension into {folder}?";
-            TiledInstallBanner.IsVisible = true;
-        }
-    }
-
-    /// <summary>Install button on the banner: the folder was already resolved to show the banner
-    /// in the first place, so this never needs the folder picker.</summary>
-    private void InstallTiledExtensionFromBanner()
-    {
-        string? folder = ResolveTiledExtensionsFolder();
-        TiledInstallBanner.IsVisible = false;
-        if (folder is not null)
-            InstallTiledExtensionAndReport(folder);
-    }
-
-    /// <summary>
-    /// "Install Tiled Integration…" menu command. Installs straight to a known folder
-    /// (detected, or previously chosen by the user); when no folder is known, opens a folder
-    /// picker and validates the pick before installing and remembering it for next time (#1128).
-    /// </summary>
-    private async void OnInstallTiledExtensionClick(object? sender, RoutedEventArgs e) =>
-        await InstallTiledExtensionViaMenuAsync();
-
-    private async Task InstallTiledExtensionViaMenuAsync()
-    {
-        string? folder = ResolveTiledExtensionsFolder();
-        if (folder is not null)
-        {
-            InstallTiledExtensionAndReport(folder);
-            return;
-        }
-
-        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Choose Tiled's extensions folder",
-            AllowMultiple = false,
-        });
-        if (folders.Count == 0 || folders[0].Path.LocalPath is not { } pickedPath) return;
-
-        InstallTiledExtensionToPickedFolder(pickedPath);
-    }
-
-    /// <summary>Test seam: exercises the same validate+install+remember path as
-    /// <see cref="InstallTiledExtensionViaMenuAsync"/>'s manual-pick branch without the native
-    /// folder picker, which headless tests can't drive.</summary>
-    internal void InstallTiledExtensionToPickedFolder(string pickedFolderPath)
-    {
-        string? validationError = _tiledExtensionInstaller.ValidateFolder(pickedFolderPath);
-        if (validationError is not null)
-        {
-            ShowStatusMessage(validationError, isError: true);
-            return;
-        }
-
-        _appSettings.TiledExtensionsFolderOverride = pickedFolderPath;
-        SaveSettingsFile();
-        InstallTiledExtensionAndReport(pickedFolderPath);
-    }
-
-    private void InstallTiledExtensionAndReport(string folder)
-    {
-        string? error = _tiledExtensionInstaller.Install(folder);
-        if (error is not null)
-        {
-            ShowStatusMessage(error, isError: true);
-            return;
-        }
-
-        Notifications.ShowToast($"Installed the Tiled .achj import extension to {folder}.");
-    }
-
     // ── Automatic-update banner (issue #982) ──────────────────────────────────
 
     private void WireUpdateAvailableBanner()
@@ -1278,9 +1172,29 @@ public partial class MainWindow : Window
         _appCommands.LoadFailed += (path, ex) =>
             Dispatcher.UIThread.InvokeAsync(() => ShowLoadFailedDialogAsync(path, ex));
 
+        // Tab-awareness for the native-tsx/achx-push coexistence guard (issue #1147):
+        // AddAssociatedTiledTileset needs to know whether the target .tsx is open as a native-tsx
+        // project in some OTHER tab, which AppCommands/ProjectManager alone can't see -- ProjectManager
+        // only knows its own current (active) project, not the full set of tabs _tabManager owns.
+        _appCommands.IsTsxPathOpenAsNativeProject = tsxPath =>
+        {
+            var target = new FilePath(tsxPath);
+            if (_projectManager.IsNativeTsxProject && _projectManager.FileName != null &&
+                new FilePath(_projectManager.FileName) == target)
+                return true;
+            return _tabManager.Tabs.Any(t => t.Path == target && t.CachedTsxState != null);
+        };
+
         _appCommands.HotReloadFailed += (path, reason) =>
             Dispatcher.UIThread.InvokeAsync(() =>
-                ShowStatusMessage($"⚠ Reload skipped for '{Path.GetFileName(path)}': {reason}", isError: true));
+                ShowStatusMessage($"⚠ Reload skipped for '{Path.GetFileName(path)}': {reason} Saving to it is paused until it reloads.", isError: true));
+
+        _appCommands.TiledSyncFailed += (tsxPath, ex) =>
+            Dispatcher.UIThread.InvokeAsync(() => UpdateTiledSyncStatus(
+                "Tiled sync failed", _failedBrush, $"{Path.GetFileName(tsxPath)}: {ex.Message}"));
+        _appCommands.TiledSyncSucceeded += (tsxPath, appliedCount) =>
+            Dispatcher.UIThread.InvokeAsync(() => UpdateTiledSyncStatus(
+                "Tiled sync OK", _autoSaveBrush, $"{Path.GetFileName(tsxPath)}: {appliedCount} chain(s) applied"));
 
         _appCommands.EditorProjectModelChanged += path =>
             LastEditorProjectModelChangedTask = Dispatcher.UIThread.InvokeAsync(async () =>
@@ -1317,6 +1231,7 @@ public partial class MainWindow : Window
                 UpdateTitle();
                 UpdateStatusBar();
                 RefreshFilesPanel();
+                SyncGridControlsToProject();
 
                 // If that tab was an Untitled sentinel, promote it to the real file path.
                 if (toPromote != null && IsUntitledTab(toPromote))
@@ -1343,6 +1258,12 @@ public partial class MainWindow : Window
                     ? $"Exported {name}"
                     : $"Exported {name} — {string.Join(" ", warnings)}");
             });
+
+        _appCommands.TsxSaveCompletedWithWarnings += warnings =>
+            Dispatcher.UIThread.InvokeAsync(() =>
+                ShowToast($"Saved, but not every change applied — {string.Join(" ", warnings)}"));
+        _appCommands.SaveFailed += message =>
+            Dispatcher.UIThread.InvokeAsync(() => ShowToast($"Auto save failed — {message}"));
 
         Notifications.WireUndo(() => _undoManager.Undo());
 
@@ -1440,18 +1361,59 @@ public partial class MainWindow : Window
 
     private void OnSnapToGridChanged(object? sender, RoutedEventArgs e)
     {
-        WireframeCtrl.SetGrid(
-            SnapToGridCheck.IsChecked == true,
-            GetGridSizeFromInput());
+        // A native tsx project's grid can't be turned off (issue #1140) -- revert the uncheck.
+        if (_projectManager.IsNativeTsxProject && SnapToGridCheck.IsChecked != true)
+        {
+            SnapToGridCheck.IsChecked = true;
+            return;
+        }
+
+        WireframeCtrl.SetGrid(SnapToGridCheck.IsChecked == true, CurrentGrid());
         SaveCompanionFile();
     }
 
     private int GetGridSizeFromInput() => (int)(GridSizeInput.Value ?? 16m);
 
+    /// <summary>The grid the wireframe should snap to: a native tsx project's own tile grid
+    /// (margin/spacing included), else the toolbar's plain square size.</summary>
+    private TileGrid CurrentGrid() => _projectManager.TsxTileGrid ?? TileGrid.Uniform(GetGridSizeFromInput());
+
+    /// <summary>
+    /// A native tsx project's grid is fixed to the tsx's own tile grid (tile size, margin,
+    /// spacing), not user-configurable (issue #1140): sets the toolbar grid controls to match and
+    /// turns snap-to-grid on. Any further edit to the size is reverted by <see
+    /// cref="ApplyGridSize"/>. Deliberately doesn't touch <see
+    /// cref="Avalonia.Controls.Control.IsEnabled"/> on either control -- GridSizeInput's IsEnabled
+    /// is XAML-bound to SnapToGridCheck.IsChecked, and setting it directly here would permanently
+    /// replace that binding with a local value (Avalonia clears an active binding when its target
+    /// property is set imperatively), breaking the enable/disable-by-checkbox behavior for every
+    /// achx/achj project opened afterward. The toolbar's single size box shows the tile width; the
+    /// wireframe gets the full grid, so a non-square tile, margin, and spacing all snap correctly
+    /// even though the box can't display them.
+    /// </summary>
+    private void SyncGridControlsToProject()
+    {
+        if (_projectManager.IsNativeTsxProject && _projectManager.TsxTileGrid is { } tileGrid)
+        {
+            GridSizeInput.Value = tileGrid.CellWidth;
+            SnapToGridCheck.IsChecked = true;
+            WireframeCtrl.SetGrid(true, tileGrid);
+        }
+    }
+
     private void ApplyGridSize()
     {
+        // A native tsx project's grid is fixed to the tsx's own tile grid (issue #1140) -- revert
+        // any edit rather than applying it.
+        if (_projectManager.IsNativeTsxProject && _projectManager.TsxTileGrid is { } lockedGrid
+            && GetGridSizeFromInput() != lockedGrid.CellWidth)
+        {
+            GridSizeInput.Value = lockedGrid.CellWidth;
+            return;
+        }
+
         if (SnapToGridCheck.IsChecked == true)
-            WireframeCtrl.SetGrid(true, GetGridSizeFromInput());
+            WireframeCtrl.SetGrid(true, CurrentGrid());
         SaveCompanionFile();
     }
 
@@ -1948,17 +1910,18 @@ public partial class MainWindow : Window
         // *every* commit (including each one a coalescing session is made of). Sealing there would
         // close the window right after each tick and defeat coalescing entirely.
         _appCommands.SealPendingEdits();
+        LogSelectionPerf($"HandleSelectionChanged fired: {_selectedState.SelectedChains.Count} chains selected");
         // Sync the texture combo to the texture of the currently selected frame/chain
-        Dispatcher.UIThread.InvokeAsync(SyncTextureCombo);
+        Dispatcher.UIThread.InvokeAsync(() => TimeSelectionPerf("SyncTextureCombo", SyncTextureCombo));
         // Sync tree selection
-        Dispatcher.UIThread.InvokeAsync(SyncTreeSelection);
+        Dispatcher.UIThread.InvokeAsync(() => TimeSelectionPerf("SyncTreeSelection", SyncTreeSelection));
         // Refresh property inspector
-        Dispatcher.UIThread.InvokeAsync(RefreshPropertyPanel);
+        Dispatcher.UIThread.InvokeAsync(() => TimeSelectionPerf("RefreshPropertyPanel", RefreshPropertyPanel));
         // Refresh timeline strip
-        Dispatcher.UIThread.InvokeAsync(RefreshTimelineStrip);
+        Dispatcher.UIThread.InvokeAsync(() => TimeSelectionPerf("RefreshTimelineStrip", RefreshTimelineStrip));
         // The status counts are selection-aware (they show "N chains selected" for a
         // multi-select), so re-run them when the selection changes (#623).
-        Dispatcher.UIThread.InvokeAsync(UpdateStatusBar);
+        Dispatcher.UIThread.InvokeAsync(() => TimeSelectionPerf("UpdateStatusBar", UpdateStatusBar));
     }
 
     // ── Companion file (.aeproperties) ────────────────────────────────────────
@@ -1993,7 +1956,7 @@ public partial class MainWindow : Window
         {
             SnapToGridCheck.IsChecked = settings.SnapToGrid;
             GridSizeInput.Value       = settings.GridSize;
-            WireframeCtrl.SetGrid(settings.SnapToGrid, settings.GridSize);
+            WireframeCtrl.SetGrid(settings.SnapToGrid, CurrentGrid());
 
             WireframeCtrl.SetZoomPercent(settings.WireframeZoomPercent);
             PreviewCtrl.SetZoomPercent(settings.PreviewZoomPercent);
@@ -2043,6 +2006,21 @@ public partial class MainWindow : Window
         new(Avalonia.Media.Color.FromRgb(0xf0, 0xc6, 0x74));
     private static readonly Avalonia.Media.SolidColorBrush _failedBrush =
         new(Avalonia.Media.Color.FromRgb(0xe0, 0x55, 0x55));
+
+    /// <summary>
+    /// Shows the Tiled tileset sync status indicator next to the autosave dot (issue #1139).
+    /// Stays visible once first shown -- reflects the most recent sync outcome or external-change
+    /// note, updated in place as further events arrive. <paramref name="tooltip"/> carries the
+    /// full detail (which .tsx, what happened) since the label itself stays short.
+    /// </summary>
+    private void UpdateTiledSyncStatus(string label, Avalonia.Media.IBrush brush, string tooltip)
+    {
+        TiledSyncStatusPanel.IsVisible = true;
+        TiledSyncDot.Fill = brush;
+        TiledSyncLabel.Text = label;
+        ToolTip.SetTip(TiledSyncDot, tooltip);
+        ToolTip.SetTip(TiledSyncLabel, tooltip);
+    }
 
     private void UpdateStatusBar()
     {
@@ -2447,7 +2425,7 @@ public partial class MainWindow : Window
         // F3 itself is dispatched through the hotkey registry (see WireKeyboard/BuildHotkeyDefinitions).
         MenuShowDiagnostics.Click += (_, _) => ApplyDiagnostics(MenuShowDiagnostics.IsChecked == true);
         MenuSettings.Click += OnSettingsClick;
-        MenuInstallTiledExtension.Click += OnInstallTiledExtensionClick;
+        MenuAssociateTiledTileset.Click += OnAssociateTiledTilesetClick;
         MenuCopy.Click          += (_, _) => _ = HandleCopyAsync();
         MenuCut.Click           += (_, _) => _ = HandleCutAsync();
         MenuPaste.Click         += (_, _) => _ = HandlePasteAsync();
@@ -2569,13 +2547,21 @@ public partial class MainWindow : Window
     /// </summary>
     private void OpenAsNewUnsavedDocument(AnimationChainListSave content, AnimationChainSave? selectedChain = null)
     {
+        // ResetToBlankDocument (#1147) clears any native-tsx/texture-size/ReferencedPngs state
+        // the previously-active tab left behind before content replaces the fresh blank ACLS.
+        _projectManager.ResetToBlankDocument();
         _projectManager.AnimationChainListSave = content;
-        _projectManager.FileName = null;
         _selectedState.Reset();
         if (selectedChain is not null)
             _selectedState.SelectedChain = selectedChain;
         _undoManager.Clear();
         RefreshTreeView();
+        // ResetToBlankDocument above doesn't raise CurrentFileChanged (it's a plain field
+        // reset, not a load), so the title bar needs an explicit refresh here -- otherwise it
+        // keeps showing whatever file was open before (#1147: reachable via File > New when the
+        // follow-up Save As dialog is cancelled, since that's the only other path that would
+        // have updated it).
+        UpdateTitle();
 
         // Open a new numbered Untitled tab and activate it.
         var displayName = TabManager.ComputeUntitledDisplayName(
@@ -2595,7 +2581,8 @@ public partial class MainWindow : Window
             AllowMultiple = false,
             FileTypeFilter = new[]
             {
-                new FilePickerFileType("Animation Chain") { Patterns = new[] { "*.achx", "*.achj" } }
+                new FilePickerFileType("Animation Chain") { Patterns = new[] { "*.achx", "*.achj" } },
+                new FilePickerFileType("Tiled Tileset") { Patterns = new[] { "*.tsx" } },
             }
         });
 
@@ -2807,6 +2794,12 @@ public partial class MainWindow : Window
 
     private void OnSaveAsClick(object? sender, RoutedEventArgs e) =>
         _ = _appCommands.SaveCurrentAnimationChainListAsync();
+
+    /// <summary>"Associate Tiled Tileset…" menu command (issue #1133) -- picks a .tsx via the
+    /// same open-file dialog seam as everything else, then hands off to
+    /// <see cref="IAppCommands.AddAssociatedTiledTilesetViaDialogAsync"/>.</summary>
+    private void OnAssociateTiledTilesetClick(object? sender, RoutedEventArgs e) =>
+        _ = _appCommands.AddAssociatedTiledTilesetViaDialogAsync();
 
     private void OnExportPixiJsClick(object? sender, RoutedEventArgs e) =>
         _ = _appCommands.ExportToPixiJsAsync();
@@ -4089,15 +4082,36 @@ public partial class MainWindow : Window
 
     private async void OnWindowDrop(object? sender, DragEventArgs e)
     {
-        var achxFiles = AchxDropProcessor.SelectAchxFiles(DroppedFilePaths(e));
-        if (achxFiles.Count == 0) return;  // not ours — leave the tree's PNG drop to run
+        // Includes native-tsx (#1140) paths alongside achx/achj (#1147) -- LoadAnimationFileAsync
+        // dispatches either kind to the correct workflow via OpenProjectWorkflowAsync.
+        var projectFiles = AchxDropProcessor.SelectAchxFiles(DroppedFilePaths(e));
+        if (projectFiles.Count == 0) return;  // not ours — leave the tree's PNG drop to run
 
         e.Handled = true;
         // LoadAnimationFileAsync de-dupes against already-open tabs (focuses instead of
         // duplicating); awaiting in sequence opens each file and leaves the last active.
-        foreach (var path in achxFiles)
+        foreach (var path in projectFiles)
             await LoadAnimationFileAsync(path);
     }
+
+    // ---- TEMP diagnostic probe (multi-select freeze investigation) -- remove once done ----
+    private static readonly string _selectionPerfLogPath =
+        Path.Combine(Path.GetTempPath(), "ae-selection-perf.log");
+
+    private static void LogSelectionPerf(string message)
+    {
+        try { File.AppendAllText(_selectionPerfLogPath, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}"); }
+        catch { /* diagnostic-only, never let logging break the app */ }
+    }
+
+    private static void TimeSelectionPerf(string label, Action action)
+    {
+        var sw = Stopwatch.StartNew();
+        action();
+        sw.Stop();
+        LogSelectionPerf($"  {label}: {sw.ElapsedMilliseconds}ms");
+    }
+    // ---- end TEMP diagnostic probe ----
 
     private void OnTreeSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
@@ -4110,14 +4124,80 @@ public partial class MainWindow : Window
         if (!_isApplyingShiftRangeSelection)
             _treeSelectionAnchor = vm;
 
-        // Sync multi-select into SelectedState
-        _selectedState.SelectedNodes = AnimTree.SelectedItems
-            .OfType<TreeNodeVm>()
-            .Select(n => n.Data)
-            .OfType<object>()
-            .ToList();
+        if (!_treeSelectionBurstActive)
+        {
+            // Leading edge: the first event in a (possible) burst is handled immediately and
+            // synchronously, exactly like before this fix -- this is what every existing single-
+            // selection-change caller (including code that changes selection again synchronously
+            // right after, e.g. adding a shape right after a tree click) already depends on.
+            _treeSelectionBurstActive = true;
+            Dispatcher.UIThread.Post(EndTreeSelectionBurst);
+            SyncTreeSelectionFromAnimTree(vm);
+            return;
+        }
 
-        TreeBuilder.RouteNodeSelection(vm.Data, _selectedState, _projectManager.AnimationChainListSave);
+        // A rapid multi-row gesture (Shift/Ctrl+Click range, our own Shift+Arrow extension) can
+        // fire this event once PER ROW rather than once for the whole gesture -- syncing
+        // ISelectedState (which cascades into the timeline strip, property panel, preview, and
+        // status bar) on every one of those turns an O(1) selection into O(N) redundant rebuilds
+        // (measured: a 40-chain select fired this 80 times, ~8s of UI-thread work). Once the
+        // leading-edge event above has synced, every further event in the same burst is
+        // coalesced into one trailing catch-up sync instead of reacting to every intermediate
+        // step.
+        LogSelectionPerf($"---- OnTreeSelectionChanged burst event: {AnimTree.SelectedItems.Count} tree items currently selected ----");
+        _pendingTreeSelectionVm = vm;
+    }
+
+    private void EndTreeSelectionBurst()
+    {
+        _treeSelectionBurstActive = false;
+        var vm = _pendingTreeSelectionVm;
+        _pendingTreeSelectionVm = null;
+        // No further event arrived after the leading-edge sync -- nothing to catch up on. This
+        // is the common case (an ordinary single selection change), and skipping the trailing
+        // sync here is what keeps it from replaying a now-stale selection over something else
+        // that may have changed ISelectedState synchronously since (e.g. a command adding a
+        // shape and selecting it).
+        if (vm is null) return;
+
+        LogSelectionPerf($"==== EndTreeSelectionBurst trailing sync: {AnimTree.SelectedItems.Count} tree items selected ====");
+        SyncTreeSelectionFromAnimTree(vm);
+    }
+
+    /// <summary>
+    /// Resolves a still-in-flight tree-selection burst immediately instead of waiting for its
+    /// posted trailing sync. A rapid multi-row Ctrl+click fires <see cref="OnTreeSelectionChanged"/>
+    /// once per row; only the first row is synced into <see cref="ISelectedState"/> right away, and
+    /// the rest are buffered for a <c>Dispatcher.UIThread.Post</c> callback. Call this before any
+    /// command consumes <c>SelectedNodes</c>/<c>SelectedChains</c>/<c>SelectedFrames</c> to delete
+    /// or otherwise act on the current selection -- without it, the command could act on a stale,
+    /// partial selection, and the still-pending callback would then run afterward and resync
+    /// <c>SelectedNodes</c> from the tree's full (unchanged) selection, resurrecting rows the
+    /// command may have just deleted. See issue #1172 (<see cref="HandleDelete"/>).
+    /// </summary>
+    private void FlushPendingTreeSelectionBurst()
+    {
+        if (_treeSelectionBurstActive)
+            EndTreeSelectionBurst();
+    }
+
+    private void SyncTreeSelectionFromAnimTree(TreeNodeVm vm)
+    {
+        LogSelectionPerf($"==== SyncTreeSelectionFromAnimTree: {AnimTree.SelectedItems.Count} tree items selected ====");
+        var overallSw = Stopwatch.StartNew();
+
+        // Sync multi-select into SelectedState
+        TimeSelectionPerf("SelectedNodes assignment (1st SelectionChanged dispatch)", () =>
+            _selectedState.SelectedNodes = AnimTree.SelectedItems
+                .OfType<TreeNodeVm>()
+                .Select(n => n.Data)
+                .OfType<object>()
+                .ToList());
+
+        TimeSelectionPerf("RouteNodeSelection (2nd SelectionChanged dispatch)", () =>
+            TreeBuilder.RouteNodeSelection(vm.Data, _selectedState, _projectManager.AnimationChainListSave));
+
+        LogSelectionPerf($"==== SyncTreeSelectionFromAnimTree done: {overallSw.ElapsedMilliseconds}ms ====");
     }
 
     // ── Files panel ───────────────────────────────────────────────────────────
@@ -4177,6 +4257,7 @@ public partial class MainWindow : Window
                     node.PinnedVisible = visible.Contains(c);
 
             RefreshTreeThumbnails();
+            SyncTsxValidationIssuesIntoTree();
 
             // Re-select to keep visual state
             SyncTreeSelection();
@@ -4186,6 +4267,14 @@ public partial class MainWindow : Window
             _suppressTreeSelectionHandling = false;
         }
     }
+
+    /// <summary>
+    /// Refreshes the exclamation-icon decoration on every chain node from <see
+    /// cref="IProjectManager.GetChainNamesWithTsxIssues"/> (issue #1140). A no-op for an achx/achj
+    /// project, which always returns an empty set.
+    /// </summary>
+    private void SyncTsxValidationIssuesIntoTree() =>
+        TreeBuilder.ApplyValidationIssues(_treeRoots, _projectManager.GetChainNamesWithTsxIssues());
 
     /// <summary>
     /// Fully rebuilds the tree from scratch, expanding only the chains named in
@@ -4232,6 +4321,7 @@ public partial class MainWindow : Window
             RefreshFilesPanel();
 
             RefreshTreeThumbnails();
+            SyncTsxValidationIssuesIntoTree();
             SyncTreeSelection();
         }
         finally
@@ -4542,8 +4632,30 @@ public partial class MainWindow : Window
     /// <see cref="PreviewControl.GroupTracksChanged"/> — only when the group's chain membership
     /// actually changes, not on every render or unrelated selection change.
     /// </summary>
+    // Tracks what the group timeline's rows were last built from -- one TimelineStripSignature per
+    // row, same per-chain content signature the single-chain strip already uses (#452). This
+    // method's own doc comment says it should only run "when the group's chain membership actually
+    // changes," but RefreshTimelineStrip calls it on every refresh regardless (any selection
+    // change, not just a group-membership change) -- without this guard, selecting anything while
+    // a large group is active re-rebuilds every row's frame VMs and thumbnails for nothing
+    // (measured: 40 chains, ~20-35ms per redundant rebuild, several of these back to back after a
+    // large multi-select settles).
+    private IReadOnlyList<TimelineStripSignature>? _groupTimelineSignature;
+
     private void RefreshGroupTimelineTracks()
     {
+        var overallSw = Stopwatch.StartNew();
+        var groupTracks = PreviewCtrl.GroupTracks;
+
+        var newSignature = groupTracks.Select(t => TimelineStripSignature.From(t.Chain)).ToList();
+        if (_groupTimelineSignature != null && newSignature.SequenceEqual(_groupTimelineSignature))
+        {
+            RefreshGroupTimelineScrubbers();
+            LogSelectionPerf($"    RefreshGroupTimelineTracks: SKIPPED (signature unchanged), {overallSw.ElapsedMilliseconds}ms");
+            return;
+        }
+        _groupTimelineSignature = newSignature;
+
         _groupTimelineTracks.Clear();
 
         // Shared across every row (#1056) so a frame of equal duration renders at equal width in
@@ -4551,19 +4663,39 @@ public partial class MainWindow : Window
         double sharedPps = TimelineBuilder.ComputeSharedEffectivePixelsPerSecond(
             PreviewCtrl.GroupTracks.Select(t => t.Chain));
 
-        foreach (var (chain, _) in PreviewCtrl.GroupTracks)
+        LogSelectionPerf($"    RefreshGroupTimelineTracks: {groupTracks.Count} tracks, sharedPps computed at {overallSw.ElapsedMilliseconds}ms");
+
+        long buildMs = 0, colorMs = 0, thumbMs = 0;
+        int frameCount = 0, thumbCount = 0;
+        var stepSw = new Stopwatch();
+        foreach (var (chain, _) in groupTracks)
         {
+            stepSw.Restart();
             var track = new ChainTimelineTrackVm(chain, TimelineBuilder.BuildFrameItems(chain, sharedPps));
+            buildMs += stepSw.ElapsedMilliseconds;
+            frameCount += track.Frames.Count;
+
             if (chain.Frames.Count > 0)
             {
+                stepSw.Restart();
                 var colors = EffectiveFrameColor.ResolveAll(chain.Frames);
+                colorMs += stepSw.ElapsedMilliseconds;
+
                 for (int i = 0; i < chain.Frames.Count && i < track.Frames.Count; i++)
+                {
+                    stepSw.Restart();
                     track.Frames[i].Thumbnail = _thumbnailService.GetFrameThumbnail(chain.Frames[i], colors[i], 22, 18);
+                    thumbMs += stepSw.ElapsedMilliseconds;
+                    thumbCount++;
+                }
             }
             _groupTimelineTracks.Add(track);
         }
+        LogSelectionPerf($"    RefreshGroupTimelineTracks loop: {frameCount} total frames, BuildFrameItems={buildMs}ms, ResolveAll(colors)={colorMs}ms, GetFrameThumbnail={thumbMs}ms across {thumbCount} calls");
 
+        stepSw.Restart();
         RefreshGroupTimelineScrubbers();
+        LogSelectionPerf($"    RefreshGroupTimelineTracks: RefreshGroupTimelineScrubbers={stepSw.ElapsedMilliseconds}ms, TOTAL={overallSw.ElapsedMilliseconds}ms");
     }
 
     /// <summary>
@@ -4933,6 +5065,8 @@ public partial class MainWindow : Window
     {
         PropChainLocked.IsCheckedChanged += (_, _) => ApplyChainLocked();
         PropChainLoop.IsCheckedChanged += (_, _) => ApplyChainLoop();
+        PropChainTsxOwnerInput.ValueChanged += (_, _) => ApplyChainTsxOwnerTileId();
+        PropChainTsxOwnerSyncButton.Click += (_, _) => SyncChainTsxOwnerTileIdToFirstFrame();
         PropFlipH.IsCheckedChanged += (_, _) => ApplyFrameFlip();
         PropFlipV.IsCheckedChanged += (_, _) => ApplyFrameFlip();
         PropFlipD.IsCheckedChanged += (_, _) => ApplyFrameFlip();
@@ -5274,14 +5408,36 @@ public partial class MainWindow : Window
                 PropChainLocked.IsChecked = selectedChain!.IsLocked;
                 PropChainLoop.IsChecked = selectedChain.Loop;
             }
+            // Owner tile (#1182): native-tsx projects only -- an achx/achj chain has no Tiled
+            // tile to own. Re-reads on every refresh (not just selection change) so an edit made
+            // through the field itself picks up the committed value, including a value the
+            // ownership-transfer/stale-reuse machinery in ProjectManager might have adjusted.
+            PropChainTsxOwnerSection.IsVisible = chainOnly && _projectManager.IsNativeTsxProject;
+            if (chainOnly && _projectManager.IsNativeTsxProject)
+            {
+                var ownerTileId = _projectManager.GetTsxOwnerTileId(selectedChain!);
+                PropChainTsxOwnerInput.Value = ownerTileId.HasValue ? ownerTileId.Value : null;
+                PropChainTsxOwnerError.IsVisible = false;
+            }
             // LoopToggle mirrors the selected chain's Loop regardless of whether a frame/shape
             // within it is also selected (#1120) -- it reflects "the chain currently playing",
             // not just the chain-only inspector view PropChainLoop above is scoped to.
             if (selectedChain is not null)
                 LoopToggle.IsChecked = selectedChain.Loop;
             PropFramePanel.IsVisible  = frame is not null && !hasShapeSelection;
-            PropRectPanel.IsVisible   = rect  is not null;
-            PropCirclePanel.IsVisible = circ  is not null;
+            PropRectPanel.IsVisible   = rect  is not null && !_projectManager.IsNativeTsxProject;
+            PropCirclePanel.IsVisible = circ  is not null && !_projectManager.IsNativeTsxProject;
+
+            // A native tsx project can't express flip/relative-offset/color data (issue #1140) --
+            // hide the sections that would let a user set values that get silently dropped on save.
+            // These never actually contain data for a tsx-originated frame (the reverse mapper
+            // never populates them), so this is about not offering the controls at all, not about
+            // clearing anything.
+            PropTransformSection.IsVisible = !_projectManager.IsNativeTsxProject;
+            PropColorSection.IsVisible     = !_projectManager.IsNativeTsxProject;
+            // A Tiled tile animation always loops: Loop (#1120) has no tsx representation.
+            PropChainLoop.IsEnabled = !_projectManager.IsNativeTsxProject;
+            LoopToggle.IsEnabled    = !_projectManager.IsNativeTsxProject;
 
             // Disable (not just visually leave typeable) whichever panel is showing when its
             // owning chain is locked -- AppCommands already no-ops the edit, so a still-enabled
@@ -5370,6 +5526,17 @@ public partial class MainWindow : Window
                     SetValueOrMixed(PropPixelW, frames.Select(f => (decimal)FrameDisplayValues.GetPixelWidth(f, bmpW)).ToList());
                     SetValueOrMixed(PropPixelH, frames.Select(f => (decimal)FrameDisplayValues.GetPixelHeight(f, bmpH)).ToList());
                 }
+
+                // Read-only tile id readout (#1182), native-tsx projects only -- independent of
+                // which tile OWNS the chain's animation (PropChainTsxOwnerInput above). Lets a
+                // user visually spot "the owner tile doesn't match any current frame" by eye.
+                PropFrameTsxTileText.IsVisible = _projectManager.IsNativeTsxProject;
+                if (_projectManager.IsNativeTsxProject)
+                {
+                    PropFrameTsxTileText.Text = _projectManager.ComputeFrameTileId(frame) is { } tileId
+                        ? $"Tile: {tileId}"
+                        : "Tile: (doesn't map to a whole tile)";
+                }
             }
 
             if (rect is not null)
@@ -5423,6 +5590,35 @@ public partial class MainWindow : Window
         var chain = _selectedState.SelectedChain;
         if (chain is null || PropChainLoop.IsChecked is not { } loop) return;
         _appCommands.SetChainLoop(chain, loop);
+    }
+
+    /// <summary>Commits <see cref="PropChainTsxOwnerInput"/>'s value via <see
+    /// cref="IAppCommands.SetChainTsxOwnerTileId"/> (issue #1182), showing the returned validation
+    /// error (if any) in <see cref="PropChainTsxOwnerError"/> instead of silently reverting -- the
+    /// field is left as the user typed it so they can see and fix what's wrong, rather than having
+    /// it snap back with no explanation.</summary>
+    private void ApplyChainTsxOwnerTileId()
+    {
+        if (_suppressPropRefresh) return;
+        var chain = _selectedState.SelectedChain;
+        if (chain is null || PropChainTsxOwnerInput.Value is not { } value || value < 0) return;
+
+        var error = _appCommands.SetChainTsxOwnerTileId(chain, (uint)value);
+        PropChainTsxOwnerError.Text = error;
+        PropChainTsxOwnerError.IsVisible = error is not null;
+    }
+
+    private void SyncChainTsxOwnerTileIdToFirstFrame()
+    {
+        var chain = _selectedState.SelectedChain;
+        if (chain is null || chain.Frames.Count == 0) return;
+        if (_projectManager.ComputeFrameTileId(chain.Frames[0]) is not { } tileId) return;
+
+        var error = _appCommands.SetChainTsxOwnerTileId(chain, tileId);
+        PropChainTsxOwnerError.Text = error;
+        PropChainTsxOwnerError.IsVisible = error is not null;
+        if (error is null)
+            PropChainTsxOwnerInput.Value = tileId;
     }
 
     private void ApplyFrameFlip()
@@ -5701,7 +5897,7 @@ public partial class MainWindow : Window
                 return;
             }
 
-            await _appCommands.OpenAchxWorkflowAsync(fileName);
+            await _appCommands.OpenProjectWorkflowAsync(fileName);
             // Restore this tab's prior history if it was previously open (snapshot normally
             // null on first open; non-null if the tab was closed and re-opened mid-session).
             if (arrivedTab?.UndoSnapshot != null)
@@ -5885,7 +6081,7 @@ public partial class MainWindow : Window
 
     // ── Preview pane height ──────────────────────────────────────────────────
     // The AchxEditorPane's row 3 (bottom preview panel) is resized by dragging the
-    // GridSplitter at row 2. See PreviewPaneHeightValidator for the bounds a stored value
+    // GridSplitter at row 2. See PersistedDimensionValidator for the bounds a stored value
     // is checked against (#904).
     private const double MinPreviewPaneHeight = 80;
     private const double MaxPreviewPaneHeight = 2000;
@@ -5894,7 +6090,7 @@ public partial class MainWindow : Window
     /// <summary>Applies the persisted (or default, if missing/invalid) preview-pane row height.</summary>
     private void ApplyPersistedPreviewPaneHeight()
     {
-        var resolved = PreviewPaneHeightValidator.Resolve(
+        var resolved = PersistedDimensionValidator.Resolve(
             _appSettings.PreviewPaneHeight, MinPreviewPaneHeight, MaxPreviewPaneHeight, DefaultPreviewPaneHeight);
         AchxEditorPane.RowDefinitions[3].Height = new GridLength(resolved, GridUnitType.Pixel);
     }
@@ -5904,6 +6100,22 @@ public partial class MainWindow : Window
     {
         if (_appSettings.WindowMaximized)
             WindowState = WindowState.Maximized;
+    }
+
+    // ── Sidebar width ─────────────────────────────────────────────────────────
+    // The MainContentGrid's column 0 (left sidebar) is resized by dragging the GridSplitter
+    // at column 1. See PersistedDimensionValidator for the bounds a stored value is checked
+    // against (#1178).
+    private const double MinSidebarWidth = 150;
+    private const double MaxSidebarWidth = 1200;
+    private const double DefaultSidebarWidth = 300;
+
+    /// <summary>Applies the persisted (or default, if missing/invalid) sidebar column width.</summary>
+    private void ApplyPersistedSidebarWidth()
+    {
+        var resolved = PersistedDimensionValidator.Resolve(
+            _appSettings.SidebarWidth, MinSidebarWidth, MaxSidebarWidth, DefaultSidebarWidth);
+        MainContentGrid.ColumnDefinitions[0].Width = new GridLength(resolved, GridUnitType.Pixel);
     }
 
     private static uint ToArgb(SKColor color) =>
@@ -6724,6 +6936,15 @@ public partial class MainWindow : Window
 
     private void HandleDelete()
     {
+        // A rapid multi-row tree selection (Ctrl+click several chains/frames) can still have its
+        // trailing catch-up sync pending (see FlushPendingTreeSelectionBurst's doc comment) when
+        // Delete fires. Reading SelectedChains/SelectedFrames below without flushing first would
+        // delete only the partial, stale selection the leading-edge sync captured -- and the
+        // pending sync would then still run afterward and resync SelectedNodes from the tree's
+        // full (unchanged) selection, resurrecting the rows just deleted back into the selection
+        // so the wireframe draws their frames again. See issue #1172.
+        FlushPendingTreeSelectionBurst();
+
         // Delete the whole multi-selection of the focused node's kind, not just the
         // focused node — the delete commands batch them into a single undo step.
         // All kinds are fully undoable, so they delete immediately and surface an

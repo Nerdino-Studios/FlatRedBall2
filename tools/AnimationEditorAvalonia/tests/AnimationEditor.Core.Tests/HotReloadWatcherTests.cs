@@ -1,5 +1,4 @@
 using AnimationEditor.Core.HotReload;
-using System;
 using System.IO;
 using Xunit;
 
@@ -28,6 +27,28 @@ public class HotReloadWatcherTests
             var ex = Record.Exception(() => watcher.StartWatching(achx, new[] { pngWithDotDot }));
 
             Assert.Null(ex);
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    // #1147 pass #22: RecordOwnSave remembers what the file held when we wrote it, so an event
+    // inside the cooldown window is only our own echo while the file still holds that content.
+    [Fact]
+    public void IsStillOwnContent_FileUnchangedSinceOwnSave_True_AndFalseAfterExternalWrite()
+    {
+        var root = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            var achx = Path.Combine(root, "hero.achx");
+            File.WriteAllText(achx, "<AnimationChainArraySave/>");
+            using var watcher = new HotReloadWatcher();
+            watcher.RecordOwnSave(achx);
+
+            Assert.True(watcher.IsStillOwnContent(achx));
+
+            File.WriteAllText(achx, "<AnimationChainArraySave><Edited/></AnimationChainArraySave>");
+
+            Assert.False(watcher.IsStillOwnContent(achx));
         }
         finally { Directory.Delete(root, true); }
     }

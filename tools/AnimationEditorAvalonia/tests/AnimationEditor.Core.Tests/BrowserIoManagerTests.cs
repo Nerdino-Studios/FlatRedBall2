@@ -3,6 +3,7 @@ using AnimationEditor.Core.Data;
 using AnimationEditor.Core.IO;
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Xunit;
 using FilePath = AnimationEditor.Core.Paths.FilePath;
@@ -181,5 +182,56 @@ public class BrowserIoManagerTests
         var (ioManager, _, _) = Setup();
 
         Assert.False(ioManager.RecoveryFileExists());
+    }
+
+    // ── Associated Tiled tilesets ─────────────────────────────────────────────
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_WritesToStoreUnderTiledSyncCompanionName()
+    {
+        var (ioManager, store, _) = Setup();
+
+        ioManager.AddAssociatedTiledTilesetPath("hero.achx", "Heroes.tsx");
+
+        Assert.True(store.Written.ContainsKey("hero.tiledsync"));
+        Assert.False(store.Written.ContainsKey("hero.aeproperties"));
+        Assert.StartsWith("{", store.Written["hero.tiledsync"].TrimStart());
+    }
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_CorruptExistingTiledSyncFile_RaisesTiledSyncParseFailed()
+    {
+        var (ioManager, store, _) = Setup();
+        store.Written["hero.tiledsync"] = "{ not valid json";
+
+        (string achxFile, Exception ex)? captured = null;
+        ioManager.TiledSyncParseFailed += (achxFile, ex) => captured = (achxFile, ex);
+        ioManager.AddAssociatedTiledTilesetPath("hero.achx", "Heroes.tsx");
+
+        Assert.NotNull(captured);
+        Assert.Equal("hero.achx", captured!.Value.achxFile);
+    }
+
+    [Fact]
+    public void AddAssociatedTiledTilesetPath_SecondDifferentPath_IsAppendedToStoredList()
+    {
+        var (ioManager, store, _) = Setup();
+
+        ioManager.AddAssociatedTiledTilesetPath("hero.achx", "Heroes.tsx");
+        ioManager.AddAssociatedTiledTilesetPath("hero.achx", "Enemies.tsx");
+
+        var json = store.Written["hero.tiledsync"];
+        var deserialized = JsonSerializer.Deserialize(json, AETiledSyncJsonContext.Default.AETiledSyncSave);
+        Assert.Equal(["Heroes.tsx", "Enemies.tsx"], deserialized!.TiledTilesetPaths);
+    }
+
+    [Fact]
+    public void GetAssociatedTiledTilesetPaths_AlwaysReturnsEmpty_SynchronousReadNotSupported()
+    {
+        var (ioManager, _, _) = Setup();
+        ioManager.AddAssociatedTiledTilesetPath("hero.achx", "Heroes.tsx");
+
+        // Unlike desktop's IoManager, the browser store is async-only -- documented limitation.
+        Assert.Empty(ioManager.GetAssociatedTiledTilesetPaths("hero.achx"));
     }
 }

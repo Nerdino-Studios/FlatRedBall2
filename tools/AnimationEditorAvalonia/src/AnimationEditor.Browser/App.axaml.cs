@@ -177,6 +177,7 @@ public partial class App : Application
         var notifications = new EditorNotificationOverlay();
         notifications.WireUndo(() => undoManager.Undo());
         appCommands.ItemsDeleted += notifications.ShowItemDeleted;
+        appCommands.SaveFailed += message => notifications.ShowToast($"Auto save failed — {message}");
         var dialogs = new EditorDialogOverlay();
         appCommands.ConfirmAsync = (message, title) =>
             EditorDialogs.ConfirmAsync(dialogs, message, title);
@@ -631,8 +632,11 @@ public partial class App : Application
             }
             else
             {
-                projectManager.AnimationChainListSave = new AnimationChainListSave();
-                projectManager.FileName = null;
+                // ResetToBlankDocument (#1147) also clears native-tsx/texture-size/
+                // ReferencedPngs state -- not reachable via this build today (nothing here calls
+                // LoadTsxProject), but kept consistent with every other "start fresh" site so a
+                // future tsx-on-browser extension doesn't reintroduce the leak.
+                projectManager.ResetToBlankDocument();
                 selectedState.Reset();
                 undoManager.Clear();
             }

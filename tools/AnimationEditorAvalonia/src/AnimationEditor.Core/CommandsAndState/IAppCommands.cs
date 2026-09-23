@@ -49,6 +49,27 @@ namespace AnimationEditor.Core.CommandsAndState
         event Action<string, IReadOnlyList<string>>? PixiJsExportCompleted;
 
         /// <summary>
+        /// Raised after <see cref="SaveCurrentAnimationChainList"/> saves a native tsx project
+        /// (<see cref="ProjectManager.IsNativeTsxProject"/>) with one or more chains whose mapping
+        /// failed this save (bad geometry, wrong texture, etc. -- see <see
+        /// cref="ProjectManager.SaveTsxProject"/>). The chain's previously-written tile is left
+        /// untouched rather than cleared, but the edit that caused the failure was NOT written; the
+        /// app layer should surface these as a toast so the user knows the save didn't fully apply.
+        /// Never raised for an achx/achj save or a tsx save with no warnings.
+        /// </summary>
+        event Action<IReadOnlyList<string>>? TsxSaveCompletedWithWarnings;
+
+        /// <summary>
+        /// Raised when <see cref="SaveCurrentAnimationChainList"/> could not write the file at all
+        /// (the exception's message): a disk/permissions error, or for a native tsx project a
+        /// tile claimed by two chains (e.g. a just-duplicated chain still animating the same
+        /// cells as its source). The file is left exactly as it was and <see
+        /// cref="IUndoManager.SaveState"/> goes to <see cref="Commands.SaveState.Failed"/>; the
+        /// app layer should surface the reason, since the status bar alone only says "failed".
+        /// </summary>
+        event Action<string>? SaveFailed;
+
+        /// <summary>
         /// Raised after a frame, shape, or animation chain is deleted, carrying a short
         /// label for the deleted item(s). The app layer shows an undo toast in response.
         /// </summary>
@@ -66,7 +87,10 @@ namespace AnimationEditor.Core.CommandsAndState
         /// Fired when <see cref="ReloadAchxFromDisk"/> detects a mangled file (bad XML,
         /// Git conflict markers, etc.). The first argument is the file path; the second is
         /// a user-readable reason. Project state is left unchanged and the undo stack is
-        /// not cleared. Use this to surface a toast rather than a blocking error dialog.
+        /// not cleared -- but the in-memory model is now stale relative to disk, so <see
+        /// cref="SaveCurrentAnimationChainList"/> refuses to write that path (raising <see
+        /// cref="SaveFailed"/>) until a later reload of it succeeds; Save As to another path
+        /// still works. Use this to surface a toast rather than a blocking error dialog.
         /// </summary>
         event Action<string, string>? HotReloadFailed;
 
@@ -82,6 +106,22 @@ namespace AnimationEditor.Core.CommandsAndState
         /// </summary>
         Task OpenAchxWorkflowAsync(string path);
         void LoadAnimationChain(string fileName);
+
+        /// <summary>
+        /// Opens <paramref name="path"/> (a <c>.tsx</c>) as a native AnimationEditor project (issue
+        /// #1140) -- see <see cref="ProjectManager.LoadTsxProject"/>. Unlike <see
+        /// cref="OpenAchxWorkflowAsync"/>, there is no conversion prompt: an incompatible tsx
+        /// (wangsets/transformations/etc.) fires <see cref="LoadFailed"/> and aborts immediately.
+        /// </summary>
+        Task OpenTsxWorkflowAsync(string path);
+
+        /// <summary>
+        /// Dispatches to <see cref="OpenTsxWorkflowAsync"/> for a <c>.tsx</c> path, otherwise <see
+        /// cref="OpenAchxWorkflowAsync"/> -- the single entry point every tab-open call site should
+        /// use, so a native tsx project needs no changes to <c>TabKind</c>/<c>TabManager</c>
+        /// (<c>TabEntry.InferKind</c> already treats a non-png extension as a full-editor tab).
+        /// </summary>
+        Task OpenProjectWorkflowAsync(string path);
 
         /// <summary>
         /// Stores the current project model and chain/frame selection on <paramref name="tab"/>
@@ -151,6 +191,18 @@ namespace AnimationEditor.Core.CommandsAndState
         /// as <see cref="SetChainLocked"/>.
         /// </summary>
         void SetChainLoop(AnimationChainSave chain, bool loop);
+
+        /// <summary>
+        /// Explicitly overrides which Tiled tile id <paramref name="chain"/>'s <c>&lt;animation&gt;</c>
+        /// is written to on the next save (issue #1182) -- e.g. an Inspector field the user typed
+        /// into, or a "Sync to First Frame" action passing <see
+        /// cref="IProjectManager.GetTsxOwnerTileId"/>'s current frame-0-computed value back in.
+        /// Validated before committing (tileset bounds, no collision with another chain's owner
+        /// tile); returns the validation error and makes no change on failure, or <see
+        /// langword="null"/> on success. Undoable, same as any other mutating command.
+        /// </summary>
+        string? SetChainTsxOwnerTileId(AnimationChainSave chain, uint tileId);
+
         void AddFrame(AnimationChainSave chain, string? textureName = null);
 
         /// <summary>
@@ -454,5 +506,63 @@ namespace AnimationEditor.Core.CommandsAndState
 
         /// <summary>Duplicates the homogeneous multi-selection as one undo step.</summary>
         void DuplicateSelection(CopySelectionPayload payload);
+
+        // ── Tiled tileset sync (issue #1133) ─────────────────────────────────────
+
+        /// <summary>
+        /// Associates <paramref name="tsxAbsolutePath"/> with the current project (via
+        /// <see cref="IIoManager.AddAssociatedTiledTilesetPath"/>) so every future save syncs this
+        /// project's animation chains into that Tiled tileset. No-op if the project has never been
+        /// saved (<c>ProjectManager.FileName</c> is null) or the path is already associated.
+        /// </summary>
+        /// <exception cref="InvalidOperationException"><paramref name="tsxAbsolutePath"/> is
+        /// currently open as a native-tsx project in another tab (see
+        /// <see cref="IsTsxPathOpenAsNativeProject"/>, issue #1147) -- a .tsx cannot be both a
+        /// native-tsx project and an achx-push target at the same time.</exception>
+        void AddAssociatedTiledTileset(string tsxAbsolutePath);
+
+        /// <summary>
+        /// Shows an open-file dialog (via <see cref="FileDialogService"/>) for the user to pick a
+        /// <c>.tsx</c> file, then associates it via <see cref="AddAssociatedTiledTileset"/>. The
+        /// "Associate Tiled Tileset…" menu command. No-op if the dialog is cancelled or the
+        /// project has never been saved. Unlike <see cref="AddAssociatedTiledTileset"/>, a coexistence
+        /// conflict here is reported via <see cref="TiledSyncFailed"/> rather than thrown, since this
+        /// method is the fire-and-forget UI entry point.
+        /// </summary>
+        Task AddAssociatedTiledTilesetViaDialogAsync();
+
+        /// <summary>
+        /// Host-supplied check for whether <c>tsxPath</c> (an absolute path) is currently open as a
+        /// native-tsx project -- either the active tab (<see
+        /// cref="IProjectManager.IsNativeTsxProject"/>) or a backgrounded one. <see
+        /// langword="null"/> when the host hasn't wired tab awareness, which <see
+        /// cref="AddAssociatedTiledTileset"/> treats as "not open anywhere" (same permissive-default
+        /// pattern as <see cref="CanvasDefaultTexturePath"/>). Used to refuse pointing a
+        /// <c>.tiledsync</c> association at a <c>.tsx</c> while it's open natively (issue #1147) --
+        /// the symmetric block to <c>ProjectManager.LoadTsxProject</c> refusing to open a <c>.tsx</c>
+        /// that already has such an association.
+        /// </summary>
+        Func<string, bool>? IsTsxPathOpenAsNativeProject { get; set; }
+
+        /// <summary>
+        /// Raised when syncing to one associated .tsx tileset fails after a save (missing file, an
+        /// unsupported <c>TsxWriter</c> feature, etc.), or when the .tiledsync companion file
+        /// itself exists but fails to parse (see <see cref="IIoManager.TiledSyncParseFailed"/>).
+        /// The first argument is the .tsx (or .achx, for a .tiledsync parse failure) path; the
+        /// second is the exception. A failure here never affects the .achx save itself, which has
+        /// already completed by the time this fires -- the app layer should surface it as a
+        /// non-blocking toast/log entry, not retry the .achx save.
+        /// </summary>
+        event Action<string, Exception>? TiledSyncFailed;
+
+        /// <summary>
+        /// Raised when syncing to one associated .tsx tileset actually writes a change (see
+        /// <see cref="Tiled.TilesetAnimationSyncResult.Changed"/>) -- not on every sync, since
+        /// autosave runs this on nearly every edit and most saves have nothing new to write; firing
+        /// on every one would be a meaningless constant flicker rather than useful confirmation.
+        /// The first argument is the .tsx path; the second is how many chains were applied. Pairs
+        /// with <see cref="TiledSyncFailed"/> for a UI status indicator that needs both outcomes.
+        /// </summary>
+        event Action<string, int>? TiledSyncSucceeded;
     }
 }

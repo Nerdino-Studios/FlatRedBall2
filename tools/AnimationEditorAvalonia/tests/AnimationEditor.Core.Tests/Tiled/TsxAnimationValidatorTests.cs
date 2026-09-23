@@ -1,0 +1,343 @@
+using AnimationEditor.Core.Tiled;
+using DotTiled;
+using System;
+using System.Linq;
+using Xunit;
+
+namespace AnimationEditor.Core.Tests.Tiled;
+
+public class TsxAnimationValidatorTests
+{
+    // 4 columns, so tile 9 is one column right of tile 8 (row 2).
+    private static Tileset TilesetWithColumns(int columns) => new()
+    {
+        Name = "Heroes",
+        TileWidth = 16,
+        TileHeight = 16,
+        TileCount = 64,
+        Columns = columns,
+    };
+
+    [Fact]
+    public void Validate_ConsistentGroup_ReturnsNoIssues()
+    {
+        var tileset = TilesetWithColumns(4);
+        var anchor = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        anchor.Animation.Add(new Frame { TileID = 12, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        var satellite = new Tile { ID = 9, Width = 0, Height = 0 };
+        satellite.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satellite.Animation.Add(new Frame { TileID = 13, Duration = 150 });
+        satellite.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satellite);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        Assert.Empty(issues);
+    }
+
+    [Fact]
+    public void Validate_SatelliteDurationOutOfLockstep_ReturnsIssue()
+    {
+        var tileset = TilesetWithColumns(4);
+        var anchor = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        anchor.Animation.Add(new Frame { TileID = 12, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        // Tile ids stay in lockstep, but frame 1's duration was hand-edited to 999 -- this
+        // duration is silently discarded and overwritten to the anchor's on the next save
+        // (NativeTsxAnimationSync never reads a satellite's own Duration), so it must be flagged.
+        var satellite = new Tile { ID = 9, Width = 0, Height = 0 };
+        satellite.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satellite.Animation.Add(new Frame { TileID = 13, Duration = 999 });
+        satellite.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satellite);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)9, issue.TileId);
+        Assert.Contains("lockstep", issue.Message);
+    }
+
+    [Fact]
+    public void Validate_SatelliteFrameOutOfLockstep_ReturnsIssue()
+    {
+        var tileset = TilesetWithColumns(4);
+        var anchor = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        anchor.Animation.Add(new Frame { TileID = 12, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        // Second frame should be tile 13 (12 + 1 column) to stay in lockstep -- hand-edited to 14 instead.
+        var satellite = new Tile { ID = 9, Width = 0, Height = 0 };
+        satellite.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satellite.Animation.Add(new Frame { TileID = 14, Duration = 150 });
+        satellite.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satellite);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)9, issue.TileId);
+        Assert.Contains("lockstep", issue.Message);
+    }
+
+    [Fact]
+    public void Validate_TwoAnchorsShareName_ReturnsIssue()
+    {
+        // Two independently-tracked anchors (no ParentId relationship between them) both carry
+        // Name="RiseUp" -- issue #1182: nothing previously caught this, so two chains silently
+        // diverge under one shared name with no way to reconcile them from the UI.
+        var tileset = TilesetWithColumns(4);
+        var first = new Tile { ID = 8, Width = 0, Height = 0 };
+        first.Properties.Add(new StringProperty { Name = "Name", Value = "RiseUp" });
+        first.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(first);
+
+        var second = new Tile { ID = 12, Width = 0, Height = 0 };
+        second.Properties.Add(new StringProperty { Name = "Name", Value = "RiseUp" });
+        second.Animation.Add(new Frame { TileID = 12, Duration = 150 });
+        tileset.Tiles.Add(second);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)8, issue.AnchorTileId);
+        Assert.Equal((uint)12, issue.TileId);
+        Assert.Contains("RiseUp", issue.Message);
+        Assert.Contains("Name", issue.Message);
+    }
+
+    [Fact]
+    public void Validate_SatelliteSharesAnchorsName_ReturnsNoNameIssue()
+    {
+        // A satellite's Name is never read/written by this codebase (only the anchor's is), but
+        // guard against a hand-authored file where one happens to be set anyway -- a satellite is
+        // not an independent chain, so it must never trip the same-Name check against its own anchor.
+        var tileset = TilesetWithColumns(4);
+        var anchor = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchor.Properties.Add(new StringProperty { Name = "Name", Value = "RiseUp" });
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        var satellite = new Tile { ID = 9, Width = 0, Height = 0 };
+        satellite.Properties.Add(new StringProperty { Name = "Name", Value = "RiseUp" });
+        satellite.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satellite.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satellite);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        Assert.Empty(issues);
+    }
+
+    [Fact]
+    public void Validate_BackwardParentId_ReferencesAnchorAtLargerColumnOrRow_ReturnsIssue()
+    {
+        // Anchor at tile 9 (column 1, row 2, 4 columns/tileset). Tile 8 (column 0, same row)
+        // points ParentId at it -- physically to the LEFT of the anchor, a footprint shape
+        // AnimationEditor's own UI can never produce (a group only ever grows right/down from its
+        // anchor). TiledAnimationToAchjMapper now surfaces tile 8 as its own independent chain (its
+        // ParentId grouping never takes effect), so the validator must flag it.
+        var tileset = TilesetWithColumns(4);
+        var anchor = new Tile { ID = 9, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        var backwardTile = new Tile { ID = 8, Width = 0, Height = 0 };
+        backwardTile.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        backwardTile.Properties.Add(new IntProperty { Name = "ParentId", Value = 9 });
+        tileset.Tiles.Add(backwardTile);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)9, issue.AnchorTileId);
+        Assert.Equal((uint)8, issue.TileId);
+        Assert.Contains("backward", issue.Message);
+    }
+
+    [Fact]
+    public void Validate_ChainedParentId_ReferencesTileThatIsItselfASatellite_ReturnsIssue()
+    {
+        // A -- true anchor. B -- ParentId=A.ID, a legitimate satellite. C -- ParentId=B.ID,
+        // chained through a satellite rather than a true anchor. TiledAnimationToAchjMapper now
+        // surfaces C as its own independent chain (its ParentId grouping doesn't take effect), so
+        // the validator must flag this instead of silently treating it as a valid group -- same
+        // spirit as the "ParentId doesn't reference an animated tile" check just above.
+        var tileset = TilesetWithColumns(4);
+        var anchorA = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchorA.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(anchorA);
+
+        var satelliteB = new Tile { ID = 9, Width = 0, Height = 0 };
+        satelliteB.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satelliteB.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satelliteB);
+
+        var chainedC = new Tile { ID = 10, Width = 0, Height = 0 };
+        chainedC.Animation.Add(new Frame { TileID = 10, Duration = 150 });
+        chainedC.Properties.Add(new IntProperty { Name = "ParentId", Value = 9 });
+        tileset.Tiles.Add(chainedC);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)9, issue.AnchorTileId);
+        Assert.Equal((uint)10, issue.TileId);
+        Assert.Contains("itself a satellite", issue.Message);
+    }
+
+    [Fact]
+    public void Validate_ChainedParentId_IntermediateTilesOwnParentIdIsDanglingRatherThanResolving_StillFlagsTheSatellite()
+    {
+        // Y -- has an animation, but its own ParentId (999) is dangling (doesn't resolve to any
+        // animated tile) -- Y itself is flagged for that below. T -- ParentId=Y.ID, individually
+        // in lockstep with Y's own frames. TiledAnimationToAchjMapper.Map treats Y as "not a true
+        // anchor" purely because Y has *any* ParentId set (see trueAnchorTileIds), regardless of
+        // whether that ParentId resolves -- so T is never folded into a group with Y; it surfaces
+        // as its own independent chain. The validator's chained-ParentId check must mirror that
+        // exact rule (GetParentId(anchor) is non-null) rather than requiring the intermediate
+        // tile's own ParentId to additionally *resolve* to an animated tile -- the narrower
+        // "resolves" check misses this dangling-intermediate case and silently reports zero issues
+        // for T even though its ParentId grouping doesn't take effect either.
+        var tileset = TilesetWithColumns(4);
+
+        var y = new Tile { ID = 9, Width = 0, Height = 0 };
+        y.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        y.Properties.Add(new IntProperty { Name = "ParentId", Value = 999 });
+        tileset.Tiles.Add(y);
+
+        var t = new Tile { ID = 10, Width = 0, Height = 0 };
+        t.Animation.Add(new Frame { TileID = 10, Duration = 150 });
+        t.Properties.Add(new IntProperty { Name = "ParentId", Value = 9 });
+        tileset.Tiles.Add(t);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        Assert.Contains(issues, i => i.TileId == 10 && i.AnchorTileId == 9);
+    }
+
+    [Fact]
+    public void Validate_SatellitesFormNonRectangularFootprint_ReturnsIssuePerSatellite()
+    {
+        // Anchor at tile 8. Two satellites, each individually valid on its own (forward offset,
+        // resolves to a true anchor, own frames in lockstep): tile 9 at offset (1,0) and tile 12
+        // at offset (0,1). No tile exists at offset (1,1) -- the corner needed to complete the 2x2
+        // rectangle their bounding box implies. Every per-satellite check above passes for both, so
+        // only a group-level completeness check can catch this.
+        var tileset = TilesetWithColumns(4);
+        var anchor = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        var satelliteRight = new Tile { ID = 9, Width = 0, Height = 0 };
+        satelliteRight.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satelliteRight.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satelliteRight);
+
+        var satelliteBelow = new Tile { ID = 12, Width = 0, Height = 0 };
+        satelliteBelow.Animation.Add(new Frame { TileID = 12, Duration = 150 });
+        satelliteBelow.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satelliteBelow);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        Assert.Equal(2, issues.Count);
+        Assert.All(issues, i => Assert.Equal((uint)8, i.AnchorTileId));
+        var tileIds = issues.Select(i => i.TileId).ToList();
+        Assert.Contains((uint)9, tileIds);
+        Assert.Contains((uint)12, tileIds);
+        Assert.All(issues, i => Assert.Contains("don't fill every cell", i.Message));
+    }
+
+    [Fact]
+    public void Validate_ColumnsIsZero_ThrowsInsteadOfDivideByZero()
+    {
+        var tileset = TilesetWithColumns(0);
+        var anchor = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        var satellite = new Tile { ID = 9, Width = 0, Height = 0 };
+        satellite.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satellite.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satellite);
+
+        Assert.Throws<InvalidOperationException>(() => TsxAnimationValidator.Validate(tileset));
+    }
+
+    [Fact]
+    public void Validate_ParentIdReferencesNonAnimatedTile_ReturnsIssue()
+    {
+        var tileset = TilesetWithColumns(4);
+        var satellite = new Tile { ID = 9, Width = 0, Height = 0 };
+        satellite.Animation.Add(new Frame { TileID = 9, Duration = 150 });
+        satellite.Properties.Add(new IntProperty { Name = "ParentId", Value = 8 });
+        tileset.Tiles.Add(satellite);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)8, issue.AnchorTileId);
+        Assert.Contains("does not reference an animated tile", issue.Message);
+    }
+
+    // Fresh-eyes pass #18: a hand-edited frame past the tileset's tile count loads as a rect
+    // outside the image and can never be saved (MultiTileToTiledAnimationMapper skips the chain),
+    // with nothing at open time saying why.
+    [Fact]
+    public void Validate_FrameReferencesTileBeyondTileCount_ReturnsIssue()
+    {
+        var tileset = TilesetWithColumns(4); // 64 tiles
+        var anchor = new Tile { ID = 8, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        anchor.Animation.Add(new Frame { TileID = 64, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)8, issue.AnchorTileId);
+        Assert.Contains("64", issue.Message);
+        Assert.Contains("tile count", issue.Message);
+    }
+
+    [Fact]
+    public void Validate_AnimatedTileItselfBeyondTileCount_ReturnsIssue()
+    {
+        var tileset = TilesetWithColumns(4); // 64 tiles
+        var anchor = new Tile { ID = 70, Width = 0, Height = 0 };
+        anchor.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(anchor);
+
+        var issues = TsxAnimationValidator.Validate(tileset);
+
+        var issue = Assert.Single(issues);
+        Assert.Equal((uint)70, issue.TileId);
+        Assert.Contains("tile count", issue.Message);
+    }
+
+    [Fact]
+    public void Validate_TilesetHasDuplicateAnimatedTileIds_ThrowsClearErrorInsteadOfRawDictionaryException()
+    {
+        // Two animated <tile> elements sharing one id used to hit the internal id-keyed
+        // dictionary's own unchecked ArgumentException instead of this codebase's "fail loud with
+        // a clear message" precedent (same category as the Columns<=0 guard above).
+        var tileset = TilesetWithColumns(4);
+        var first = new Tile { ID = 8, Width = 0, Height = 0 };
+        first.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(first);
+        var second = new Tile { ID = 8, Width = 0, Height = 0 };
+        second.Animation.Add(new Frame { TileID = 8, Duration = 150 });
+        tileset.Tiles.Add(second);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => TsxAnimationValidator.Validate(tileset));
+
+        Assert.Contains("8", exception.Message);
+    }
+}
