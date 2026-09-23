@@ -20,6 +20,9 @@ namespace AnimationEditor.Core.Models
             tab.CachedEditorModel = pm.AnimationChainListSave;
             tab.CachedOnDiskCoordinateType = pm.OnDiskCoordinateType;
             tab.CachedDiskWriteTimeUtc = TryReadDiskWriteTimeUtc(tab.Path);
+            tab.CachedTsxState = pm.CaptureTsxState();
+            tab.CachedTextureSizeState = pm.CaptureTextureSizeState();
+            tab.CachedReferencedPngs = pm.ReferencedPngs;
         }
 
         /// <summary>
@@ -60,6 +63,9 @@ namespace AnimationEditor.Core.Models
             pm.AnimationChainListSave = tab.CachedEditorModel;
             pm.OnDiskCoordinateType = tab.CachedOnDiskCoordinateType;
             pm.FileName = string.IsNullOrEmpty(tab.Path.Original) ? null : tab.Path.FullPath;
+            pm.RestoreTsxState(tab.CachedTsxState);
+            pm.RestoreTextureSizeState(tab.CachedTextureSizeState);
+            pm.ReferencedPngs = tab.CachedReferencedPngs;
         }
 
         private static DateTime? TryReadDiskWriteTimeUtc(FilePath path)

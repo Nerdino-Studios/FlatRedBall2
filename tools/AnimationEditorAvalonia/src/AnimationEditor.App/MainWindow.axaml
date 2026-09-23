@@ -118,7 +118,7 @@
                         <Separator />
                         <MenuItem Header="Resize _Texture…" x:Name="MenuResizeTexture" />
                         <Separator />
-                        <MenuItem Header="Install _Tiled Integration…" x:Name="MenuInstallTiledExtension" />
+                        <MenuItem Header="Associate _Tiled Tileset…" x:Name="MenuAssociateTiledTileset" />
                         <Separator />
                         <MenuItem Header="_Settings…" x:Name="MenuSettings" />
                     </MenuItem>
@@ -361,60 +361,6 @@
             </DockPanel>
         </Border>
 
-        <!-- ── Tiled-extension install banner (issue #1128) ── shown at startup only when a
-             Tiled install is detected and the achj-import extension is missing/outdated there. ── -->
-        <Border x:Name="TiledInstallBanner"
-                DockPanel.Dock="Top"
-                IsVisible="False"
-                Background="{DynamicResource InfoBannerBg}"
-                BorderBrush="{DynamicResource LineBrush}"
-                BorderThickness="0,0,0,1">
-            <DockPanel>
-                <Border DockPanel.Dock="Left"
-                        Width="3"
-                        Background="{DynamicResource AccentCool}" />
-                <DockPanel Margin="12,6">
-                    <StackPanel DockPanel.Dock="Right"
-                                Orientation="Horizontal"
-                                Spacing="8"
-                                VerticalAlignment="Center">
-                        <Button x:Name="InstallTiledExtensionBtn"
-                                Content="Install"
-                                Padding="10,3"
-                                FontSize="12" />
-                        <Button x:Name="RemindLaterTiledInstallBtn"
-                                Content="Remind me later"
-                                Padding="10,3"
-                                FontSize="12"
-                                Background="Transparent"
-                                Foreground="{DynamicResource InkMid}" />
-                        <Button x:Name="DismissTiledInstallBtn"
-                                Content="Don't ask again"
-                                Padding="10,3"
-                                FontSize="12"
-                                Background="Transparent"
-                                Foreground="{DynamicResource InkMid}" />
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal"
-                                Spacing="8"
-                                VerticalAlignment="Center">
-                        <Path Width="16"
-                              Height="16"
-                              VerticalAlignment="Center"
-                              Stretch="Uniform"
-                              Fill="{DynamicResource AccentCool}"
-                              Data="M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z" />
-                        <!-- Text is always set in code (MainWindow.ShowTiledInstallBannerIfAppropriate)
-                             before this banner becomes visible, so no default belongs here. -->
-                        <TextBlock x:Name="TiledInstallBannerText"
-                                   VerticalAlignment="Center"
-                                   FontSize="12"
-                                   Foreground="{DynamicResource Ink}" />
-                    </StackPanel>
-                </DockPanel>
-            </DockPanel>
-        </Border>
-
         <Border DockPanel.Dock="Bottom"
                 Background="{DynamicResource BgRail}"
                 BorderBrush="{DynamicResource LineBrush}"
@@ -445,6 +391,23 @@
                                FontFamily="Consolas,Menlo,Monospace"
                                Foreground="{DynamicResource InkMid}"
                                VerticalAlignment="Center" />
+                    <!-- Tiled tileset sync status (issue #1139), hidden until a sync has
+                         actually written a change or failed. -->
+                    <StackPanel x:Name="TiledSyncStatusPanel"
+                                Orientation="Horizontal" Spacing="5" VerticalAlignment="Center"
+                                IsVisible="False">
+                        <Image Source="avares://AnimationEditor/Assets/icons/tiled-icon-128.png"
+                               Width="12" Height="12"
+                               IsHitTestVisible="False" />
+                        <Ellipse x:Name="TiledSyncDot"
+                                 Width="6" Height="6"
+                                 Fill="{DynamicResource AccentSoft}" />
+                        <TextBlock x:Name="TiledSyncLabel"
+                                   FontSize="11"
+                                   FontFamily="Consolas,Menlo,Monospace"
+                                   Foreground="{DynamicResource InkMid}"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
                 </StackPanel>
                 <!-- right: cursor, selection -->
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="16"
@@ -672,13 +635,26 @@
                         <Style Selector="TreeViewItem /template/ ToggleButton#PART_ExpandCollapseChevron:checked /template/ Path#ChevronPath">
                             <Setter Property="Data" Value="{StaticResource TreeViewItemExpandedChevronPathData}" />
                         </Style>
-                        <!-- Inline "Add Frame" button: hidden by default, revealed on row hover -->
+                        <!-- Inline "Add Frame" button: hidden by default, revealed on row hover.
+                             #1173: anchored on Grid.tree-row:pointerover, NOT
+                             TreeViewItem:pointerover. Avalonia's :pointerover pseudo-class
+                             propagates to every visual ancestor under the pointer, so hovering a
+                             frame row (nested inside its expanded parent chain's TreeViewItem)
+                             also marked the *parent chain's* TreeViewItem :pointerover, which
+                             then matched every descendant Button/TextBlock under it, including
+                             the chain's own, revealing its buttons and widening every row's meta
+                             text under that chain even though the pointer was never over the
+                             chain header. Grid.tree-row is the DataTemplate's own root element,
+                             i.e. just that row's header content: it does not visually contain any
+                             nested child TreeViewItems (those render in the TreeViewItem's own
+                             separate ItemsPresenter), so its :pointerover can only ever reflect
+                             the pointer being over that specific row. -->
                         <Style Selector="Button.add-frame-btn">
                             <Setter Property="Opacity" Value="0" />
                             <Setter Property="IsHitTestVisible" Value="False" />
                             <Setter Property="Focusable" Value="False" />
                         </Style>
-                        <Style Selector="TreeViewItem:pointerover Button.add-frame-btn">
+                        <Style Selector="Grid.tree-row:pointerover Button.add-frame-btn">
                             <Setter Property="Opacity" Value="1" />
                             <Setter Property="IsHitTestVisible" Value="True" />
                             <Setter Property="Focusable" Value="True" />
@@ -692,7 +668,7 @@
                             <Setter Property="IsHitTestVisible" Value="False" />
                             <Setter Property="Focusable" Value="False" />
                         </Style>
-                        <Style Selector="TreeViewItem:pointerover Button.lock-btn">
+                        <Style Selector="Grid.tree-row:pointerover Button.lock-btn">
                             <Setter Property="Opacity" Value="1" />
                             <Setter Property="IsHitTestVisible" Value="True" />
                             <Setter Property="Focusable" Value="True" />
@@ -710,14 +686,19 @@
                              reveals both add-frame and lock together). The lock lane sits further
                              from the edge than add-frame's, so clearing it clears both. The
                              ":not(.locked)" on the hover rule keeps a locked+hovered row on the
-                             locked margin rather than depending on style declaration order. -->
+                             locked margin rather than depending on style declaration order.
+                             The hover rule is also scoped to TextBlock.meta.chain (bound to
+                             IsChainNode, #1173): only the chain's own meta text may ever grow a
+                             lane (frames never show add-frame/lock icons), so without the
+                             ".chain" class this rule would widen a frame's own meta text on
+                             hover of that same frame, for no reason. -->
                         <Style Selector="TextBlock.meta">
                             <Setter Property="Margin" Value="8,0,8,0" />
                         </Style>
                         <Style Selector="TextBlock.meta.locked">
                             <Setter Property="Margin" Value="8,0,56,0" />
                         </Style>
-                        <Style Selector="TreeViewItem:pointerover TextBlock.meta:not(.locked)">
+                        <Style Selector="Grid.tree-row:pointerover TextBlock.meta.chain:not(.locked)">
                             <Setter Property="Margin" Value="8,0,56,0" />
                         </Style>
                         <!-- Pending cut (Ctrl+X): light orange wash across the full row -->
@@ -736,8 +717,13 @@
                                  hover-only Add-Frame button floated on top at the right. Floating the
                                  button (instead of giving it its own grid column) keeps every row's Meta
                                  on the same right edge — chain rows are no longer inset by the button while
-                                 frame rows hug the edge (the jagged offset in #623). -->
-                            <Grid HorizontalAlignment="Stretch">
+                                 frame rows hug the edge (the jagged offset in #623). Classes="tree-row"
+                                 scopes the hover-reveal styles above to just this row (#1173).
+                                 Background="Transparent" (not left null) makes the whole row
+                                 hit-test-visible, not just its child controls, since otherwise
+                                 hovering empty space between the header text and the meta text
+                                 would fail to trigger Grid.tree-row:pointerover. -->
+                            <Grid Classes="tree-row" Background="Transparent" HorizontalAlignment="Stretch">
                             <Grid ColumnDefinitions="Auto,*,Auto" HorizontalAlignment="Stretch">
                             <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                                     <!-- Node kind icons: SVG files are the single source of truth for path data. -->
@@ -774,6 +760,17 @@
                                              VerticalAlignment="Center"
                                              Path="avares://AnimationEditor.Views/Assets/icons/svg/IconCircle.svg"
                                              CurrentColor="{DynamicResource IconInkDim}" />
+                                    <!-- Native tsx project validation issue (#1140): a multi-tile group whose
+                                         satellite tile has drifted out of lockstep with its anchor, or a
+                                         dangling ParentId. Only ever set on chain nodes, from
+                                         TreeBuilder.ApplyValidationIssues. -->
+                                    <svg:Svg IsVisible="{Binding HasValidationIssue}"
+                                             ToolTip.Tip="This animation can't be represented correctly in this tsx file - see the tileset's group tiles."
+                                             Width="14" Height="14"
+                                             Margin="0,0,4,0"
+                                             VerticalAlignment="Center"
+                                             Path="avares://AnimationEditor.Views/Assets/icons/svg/IconWarning.svg"
+                                             CurrentColor="{DynamicResource IconWarning}" />
                                 </StackPanel>
                                 <!-- Header lives in the star column so it ellipsizes when the panel is
                                      narrowed instead of forcing a horizontal scrollbar (#623). -->
@@ -806,6 +803,7 @@
                                 <TextBlock Grid.Column="2"
                                            Classes="meta"
                                            Classes.locked="{Binding IsLocked}"
+                                           Classes.chain="{Binding IsChainNode}"
                                            Text="{Binding Meta}"
                                            Foreground="{DynamicResource AccentCool}"
                                            FontSize="11"
@@ -980,6 +978,46 @@
                                                           AutomationProperties.AutomationId="prop-chain-loop" />
                                             </StackPanel>
                                         </Border>
+
+                                        <!-- ── Owner tile (#1182) ── native-tsx projects only:
+                                             which physical Tiled tile carries this chain's
+                                             <animation> block. Previously hidden save-time
+                                             bookkeeping; now explicit and user-settable. -->
+                                        <Border x:Name="PropChainTsxOwnerSection"
+                                                BorderBrush="{DynamicResource LineBrush}"
+                                                BorderThickness="0,0,0,1"
+                                                Padding="12,8,12,10"
+                                                IsVisible="False">
+                                            <StackPanel Spacing="8">
+                                                <TextBlock Text="TILED"
+                                                           FontSize="11"
+                                                           FontWeight="SemiBold"
+                                                           Foreground="{DynamicResource InkMid}" />
+                                                <Grid ColumnDefinitions="Auto,*">
+                                                    <TextBlock Text="Placed Tile"
+                                                               VerticalAlignment="Center"
+                                                               Margin="0,0,8,0"
+                                                               Foreground="{DynamicResource InkMid}"
+                                                               FontSize="11" />
+                                                    <NumericUpDown x:Name="PropChainTsxOwnerInput"
+                                                                   Grid.Column="1"
+                                                                   MinWidth="80"
+                                                                   Minimum="0"
+                                                                   Increment="1"
+                                                                   FormatString="0"
+                                                                   AutomationProperties.AutomationId="prop-chain-tsx-owner" />
+                                                </Grid>
+                                                <Button x:Name="PropChainTsxOwnerSyncButton"
+                                                        Content="Sync to First Frame"
+                                                        HorizontalAlignment="Left"
+                                                        AutomationProperties.AutomationId="prop-chain-tsx-owner-sync" />
+                                                <TextBlock x:Name="PropChainTsxOwnerError"
+                                                           Foreground="{DynamicResource Danger}"
+                                                           FontSize="11"
+                                                           TextWrapping="Wrap"
+                                                           IsVisible="False" />
+                                            </StackPanel>
+                                        </Border>
                                     </StackPanel>
 
                                     <!-- ── Frame properties ── -->
@@ -1028,6 +1066,15 @@
                                                         </Grid>
                                                     </WrapPanel>
                                                 </StackPanel>
+                                                <!-- Read-only (#1182): the Tiled tile id this
+                                                     frame's own rect resolves to, independent of
+                                                     which tile OWNS the chain's animation (see
+                                                     PropChainTsxOwnerInput above). Native-tsx
+                                                     projects only. -->
+                                                <TextBlock x:Name="PropFrameTsxTileText"
+                                                           Foreground="{DynamicResource InkMid}"
+                                                           FontSize="11"
+                                                           IsVisible="False" />
 
                                             </StackPanel>
                                         </Border>
@@ -1055,7 +1102,8 @@
                                         </Border>
 
                                         <!-- TRANSFORM section -->
-                                        <Border BorderBrush="{DynamicResource LineBrush}"
+                                        <Border x:Name="PropTransformSection"
+                                                BorderBrush="{DynamicResource LineBrush}"
                                                 BorderThickness="0,0,0,1"
                                                 Padding="12,8,12,10">
                                             <StackPanel Spacing="8">
@@ -1137,7 +1185,8 @@
                                         </Border>
 
                                         <!-- COLOR section: per-frame tint. Mode previews as a reference; runtimes apply it as they choose. -->
-                                        <Border BorderBrush="{DynamicResource LineBrush}"
+                                        <Border x:Name="PropColorSection"
+                                                BorderBrush="{DynamicResource LineBrush}"
                                                 BorderThickness="0,0,0,1"
                                                 Padding="12,8,12,10">
                                             <StackPanel Spacing="8">

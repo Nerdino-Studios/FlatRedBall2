@@ -4,6 +4,7 @@ using AnimationEditor.Core.HotReload;
 using AnimationEditor.Core.IO;
 using AnimationEditor.Core.Models;
 using AnimationEditor.Core.Rendering;
+using AnimationEditor.Core.Tiled;
 using AnimationEditor.Core.Utilities;
 using FlatRedBall2.Animation;
 using FlatRedBall2.AnimationEditorCommon;
@@ -54,20 +55,25 @@ namespace AnimationEditor.Core.CommandsAndState
             _undoManager = undoManager;
 
             // Autosave policy: every command that mutates the animation data raises
-            // AnimationChainsChanged (constructors/Do() of ~20 IUndoableCommand types, plus a
-            // couple of direct call sites in this class). This is the single place that reacts
+            // AnimationChainsChanged (constructors/Do() of ~30 IUndoableCommand types, plus a
+            // couple of direct call sites in this class). This is the ONLY place that reacts
             // to it by writing the change to disk -- it used to live in MainWindow (the Avalonia
             // app layer), which meant "does an edit actually get saved" had zero test coverage
             // and was twice misdiagnosed while investigating issue #839. Living here instead
             // means AppCommandsSaveOnChangeTests exercises it with no Avalonia/UI involved.
             _events.AnimationChainsChanged += OnAnimationChainsChanged;
+
+            // A corrupt .tiledsync is a Tiled-sync problem same as a broken .tsx write -- route
+            // it through the one event the UI already listens on (issue #1139) rather than
+            // adding a second failure channel it would also need to wire up.
+            _ioManager.TiledSyncParseFailed += (achxFile, ex) => TiledSyncFailed?.Invoke(achxFile, ex);
         }
 
-        private void OnAnimationChainsChanged()
-        {
-            if (!string.IsNullOrEmpty(_pm.FileName))
-                SaveCurrentAnimationChainList();
-        }
+        // The one save per edit. SaveCurrentAnimationChainList itself writes the crash-recovery
+        // snapshot when there is no file yet, so an untitled document is covered too. Commands
+        // must NOT call SaveCurrentAnimationChainList on their own as well: every edit, undo and
+        // redo used to be written twice (two disk writes, two Tiled-sync pushes, two toasts).
+        private void OnAnimationChainsChanged() => SaveCurrentAnimationChainList();
 
         // ── Chain lock (#1032) ────────────────────────────────────────────────────
         // A locked chain's frame/shape *content* cannot be edited (add/delete/move/duplicate/
@@ -102,8 +108,28 @@ namespace AnimationEditor.Core.CommandsAndState
         public void SetChainLocked(AnimationChainSave chain, bool locked) =>
             _undoManager.Execute(new SetChainLockedCommand(chain, locked, this, _events));
 
-        public void SetChainLoop(AnimationChainSave chain, bool loop) =>
+        public void SetChainLoop(AnimationChainSave chain, bool loop)
+        {
+            if (IsAchxOnlyEditBlocked()) return;
             _undoManager.Execute(new SetChainLoopCommand(chain, loop, this, _events));
+        }
+
+        public string? SetChainTsxOwnerTileId(AnimationChainSave chain, uint tileId)
+        {
+            var command = new SetChainTsxOwnerTileIdCommand(chain, tileId, _pm, this, _events);
+            _undoManager.Execute(command);
+            return command.Error;
+        }
+
+        // -- Native tsx: achx-only data ------------------------------------------------------
+        // A Tiled tile animation holds rects and durations, nothing else (see
+        // Tiled.TsxLossyDataCheck, which warns on save about whatever slipped through). Every
+        // command that would create shapes, flips, sprite offsets, color, or a non-looping chain
+        // no-ops in a native tsx project, so no host (tree menu, inspector, keyboard, browser)
+        // can produce data the file can't keep. Same pattern as the locked-chain guards.
+
+        /// <summary>True when the current project is a native tsx, i.e. the edit must not happen.</summary>
+        private bool IsAchxOnlyEditBlocked() => _pm.IsNativeTsxProject;
         // Delegates wired up by the Avalonia app layer ----------------------------
 
         /// <summary>
@@ -180,6 +206,12 @@ namespace AnimationEditor.Core.CommandsAndState
         /// <inheritdoc cref="IAppCommands.PixiJsExportCompleted"/>
         public event Action<string, IReadOnlyList<string>>? PixiJsExportCompleted;
 
+        /// <inheritdoc cref="IAppCommands.TsxSaveCompletedWithWarnings"/>
+        public event Action<IReadOnlyList<string>>? TsxSaveCompletedWithWarnings;
+
+        /// <inheritdoc cref="IAppCommands.SaveFailed"/>
+        public event Action<string>? SaveFailed;
+
         /// <inheritdoc cref="IAppCommands.LoadFailed"/>
         public event Action<string, Exception>? LoadFailed;
 
@@ -254,6 +286,41 @@ namespace AnimationEditor.Core.CommandsAndState
             _events.RaiseAvailableTexturesChanged();
         }
 
+        /// <inheritdoc cref="IAppCommands.OpenTsxWorkflowAsync"/>
+        public Task OpenTsxWorkflowAsync(string path)
+        {
+            try
+            {
+                _pm.LoadTsxProject(new FilePath(path));
+            }
+            catch (Exception ex)
+            {
+                LoadFailed?.Invoke(path, ex);
+                return Task.CompletedTask;
+            }
+
+            // Was hand-duplicating FinishLoadIntoEditor's steps here instead of calling it, and
+            // had drifted out of sync with it: missing HotReloadWatcher.StartWatching (a tsx's
+            // external changes -- hand edits, another tab's "sync associated Tiled tilesets" --
+            // were never picked up, no matter how long you waited) and missing
+            // LoadAndApplyCompanionFileFor (saved grid/zoom/expanded-tree-state silently dropped
+            // on every tsx open). Calling the shared helper, same as the achx open path
+            // (OpenAchxWorkflowAsync -> LoadAnimationChainFromParsed -> FinishLoadIntoEditor)
+            // below, makes this impossible to drift out of sync with again.
+            FinishLoadIntoEditor(path);
+
+            // Reuses the achx-named event -- both mean "a project file finished loading,"
+            // and every current subscriber (recent files, window title, etc.) treats it generically.
+            _events.CallAchxLoaded(path);
+            _events.RaiseCurrentFileChanged(path);
+            _events.RaiseAvailableTexturesChanged();
+            return Task.CompletedTask;
+        }
+
+        /// <inheritdoc cref="IAppCommands.OpenProjectWorkflowAsync"/>
+        public Task OpenProjectWorkflowAsync(string path) =>
+            new FilePath(path).Extension == "tsx" ? OpenTsxWorkflowAsync(path) : OpenAchxWorkflowAsync(path);
+
         // -------------------------------------------------------------------------
 
         public void LoadAnimationChain(string fileName)
@@ -288,10 +355,27 @@ namespace AnimationEditor.Core.CommandsAndState
 
         private void FinishLoadIntoEditor(string fileName)
         {
+            // A fresh, successful load of this path is by definition in sync with disk again.
+            _staleOnDiskReasons.Remove(new AnimationEditor.Core.Paths.FilePath(fileName).FullPath);
             _undoManager.Clear();
             _undoManager.MarkSaved();
             _selectedState.Reset();
             _selectedState.SelectedChain = _pm.AnimationChainListSave?.AnimationChains.FirstOrDefault();
+            RefreshEditorSurfaceForActiveProject(fileName);
+        }
+
+        /// <summary>
+        /// Refreshes everything about the editor's UI/watcher state that depends only on "this is
+        /// now the active project" — not on how it got there. Shared by <see
+        /// cref="FinishLoadIntoEditor"/> (a fresh disk load) and <see
+        /// cref="TryActivateTabFromCache"/> (reactivating an already-loaded tab), which is why it
+        /// deliberately does NOT touch undo history or selection: those two callers disagree on
+        /// what to do with them (a fresh load resets both; reactivating a cached tab must preserve
+        /// undo history and restore the tab's own prior selection instead), so each decides that
+        /// for itself before calling this.
+        /// </summary>
+        private void RefreshEditorSurfaceForActiveProject(string fileName)
+        {
             // Rebuild (not refresh): a freshly-opened file should present a collapsed,
             // scannable overview rather than every chain's frames expanded — unless a
             // companion file already recorded which chains were expanded, in which case
@@ -303,10 +387,9 @@ namespace AnimationEditor.Core.CommandsAndState
             RefreshWireframeRequested?.Invoke();
             RefreshAnimationFrameDisplayRequested?.Invoke();
 
-            // Start watching the loaded file and its referenced PNGs
-            var achxDir = System.IO.Path.GetDirectoryName(fileName) ?? string.Empty;
-            var pngPaths = GetReferencedAbsolutePngPaths(fileName, achxDir);
-            HotReloadWatcher.StartWatching(fileName, pngPaths);
+            // Start (or restart) watching the active file and its referenced PNGs. _pm.FileName is
+            // already fileName by the time either caller reaches this point.
+            SyncHotReloadWatcher();
 
             EditorProjectModelChanged?.Invoke(fileName);
         }
@@ -332,17 +415,10 @@ namespace AnimationEditor.Core.CommandsAndState
 
             TabEditorCache.ApplyToProject(tab, _pm);
             RestoreTabSelection(tab);
-            // See the comment in FinishLoadIntoEditor: build already-expanded from the
-            // companion file so reactivating a tab doesn't flicker collapsed-then-expanded.
-            RebuildTreeViewRequested?.Invoke((IReadOnlyList<string>?)_ioManager.TryLoadCompanionSettings(tab.Path.FullPath)?.ExpandedNodes ?? Array.Empty<string>());
-            _ioManager.LoadAndApplyCompanionFileFor(tab.Path.FullPath);
-            RefreshWireframeRequested?.Invoke();
-            RefreshAnimationFrameDisplayRequested?.Invoke();
-            SyncHotReloadWatcher();
+            RefreshEditorSurfaceForActiveProject(tab.Path.FullPath);
 
             _events.RaiseCurrentFileChanged(tab.Path.FullPath);
             _events.RaiseAvailableTexturesChanged();
-            EditorProjectModelChanged?.Invoke(tab.Path.FullPath);
             return true;
         }
 
@@ -357,7 +433,7 @@ namespace AnimationEditor.Core.CommandsAndState
             string? chainName = tab.CachedSelectedChainName;
             int? frameIndex = tab.CachedSelectedFrameIndex;
 
-            await OpenAchxWorkflowAsync(tab.Path.FullPath);
+            await OpenProjectWorkflowAsync(tab.Path.FullPath);
 
             tab.CachedSelectedChainName = chainName;
             tab.CachedSelectedFrameIndex = frameIndex;
@@ -416,26 +492,152 @@ namespace AnimationEditor.Core.CommandsAndState
         public void RefreshTreeView() =>
             RefreshTreeViewRequested?.Invoke();
 
+        /// <summary>
+        /// Files whose on-disk content changed under an open tab and could not be reloaded
+        /// (<see cref="ReloadAchxFromDisk"/> threw), keyed by full path with the failure reason.
+        /// The in-memory model is stale relative to disk from that moment, so writing it back
+        /// would destroy whatever the other program (Tiled, a text editor) just saved. Cleared
+        /// when a later reload of that path succeeds.
+        /// </summary>
+        private readonly Dictionary<string, string> _staleOnDiskReasons = new(StringComparer.OrdinalIgnoreCase);
+
         public void SaveCurrentAnimationChainList(string? fileName = null)
         {
             var target = fileName ?? _pm.FileName;
             if (!string.IsNullOrEmpty(target))
             {
-                HotReloadWatcher.RecordOwnSave(target);
+                if (_staleOnDiskReasons.TryGetValue(new AnimationEditor.Core.Paths.FilePath(target).FullPath, out var staleReason))
+                {
+                    _undoManager.MarkSaveFailed();
+                    SaveFailed?.Invoke(
+                        $"\"{System.IO.Path.GetFileName(target)}\" changed on disk and couldn't be reloaded ({staleReason}). " +
+                        "Saving would overwrite that change. Fix the file so it reloads, or Save As a different file.");
+                    return;
+                }
+
                 try
                 {
-                    _pm.SaveAnimationChainList(target);
+                    if (_pm.IsNativeTsxProject)
+                    {
+                        var warnings = _pm.SaveTsxProject(target);
+                        if (warnings.Count > 0)
+                            TsxSaveCompletedWithWarnings?.Invoke(warnings);
+                    }
+                    else
+                        _pm.SaveAnimationChainList(target);
+                    // After the write, so the watcher can hash what actually landed on disk.
+                    HotReloadWatcher.RecordOwnSave(target);
                     _undoManager.MarkSaved();
                     EditorProjectModelChanged?.Invoke(target);
                 }
-                catch
+                catch (Exception ex)
                 {
                     _undoManager.MarkSaveFailed();
+                    SaveFailed?.Invoke(ex.Message);
+                    return;
                 }
+
+                // A native tsx project has no achx to push from -- the achj-push feature
+                // (issue #1133) doesn't apply to it.
+                if (!_pm.IsNativeTsxProject)
+                    SyncAssociatedTiledTilesets(target);
             }
             else
             {
                 _ioManager.WriteRecoveryFile(_pm.AnimationChainListSave);
+            }
+        }
+
+        /// <inheritdoc/>
+        public event Action<string, Exception>? TiledSyncFailed;
+
+        /// <inheritdoc/>
+        public event Action<string, int>? TiledSyncSucceeded;
+
+        /// <inheritdoc/>
+        public Func<string, bool>? IsTsxPathOpenAsNativeProject { get; set; }
+
+        public void AddAssociatedTiledTileset(string tsxAbsolutePath)
+        {
+            if (string.IsNullOrEmpty(_pm.FileName)) return;
+
+            if (IsTsxPathOpenAsNativeProject?.Invoke(tsxAbsolutePath) == true)
+                throw new InvalidOperationException(
+                    $"Cannot associate \"{tsxAbsolutePath}\" -- it is currently open as a native " +
+                    "AnimationEditor project in another tab. Close that tab first, or choose a " +
+                    "different .tsx file. A .tsx cannot be both a native-tsx project and an " +
+                    "achx-push target at the same time.");
+
+            _ioManager.AddAssociatedTiledTilesetPath(_pm.FileName, tsxAbsolutePath);
+        }
+
+        public async Task AddAssociatedTiledTilesetViaDialogAsync()
+        {
+            if (string.IsNullOrEmpty(_pm.FileName)) return;
+
+            var path = await FileDialogService.PickOpenFileAsync(
+                "Associate Tiled Tileset", "tsx", "Tiled Tileset (*.tsx)");
+            if (string.IsNullOrEmpty(path)) return;
+
+            try
+            {
+                AddAssociatedTiledTileset(path);
+            }
+            catch (Exception ex)
+            {
+                TiledSyncFailed?.Invoke(path, ex);
+            }
+        }
+
+        /// <summary>
+        /// Runs on every successful .achx/.achj save (including autosave, so this must stay cheap
+        /// when nothing is associated -- see <see cref="AddAssociatedTiledTileset"/>). Runs
+        /// synchronously rather than backgrounded: the common case (no associated tilesets) is a
+        /// single list lookup, and even the rare case (a handful of .tsx files) is small XML
+        /// DotTiled I/O -- not slow enough to justify the complexity of coordinating a background
+        /// task against a project model the user may keep editing while it runs. A failure for one
+        /// .tsx never rolls back or retries the .achx save, which has already succeeded by this point.
+        /// </summary>
+        private void SyncAssociatedTiledTilesets(string achxPath)
+        {
+            var acls = _pm.AnimationChainListSave;
+            if (acls == null) return;
+
+            IReadOnlyList<string> tsxPaths;
+            try
+            {
+                tsxPaths = _ioManager.GetAssociatedTiledTilesetPaths(achxPath);
+            }
+            catch (Exception ex)
+            {
+                TiledSyncFailed?.Invoke(achxPath, ex);
+                return;
+            }
+            if (tsxPaths.Count == 0) return;
+
+            // Snapshot rather than hand the live model to the mapper: defensive even though this
+            // runs synchronously today, so this stays safe if a future change backgrounds it.
+            var snapshot = AchjSyncSnapshot.Clone(acls);
+            IReadOnlyList<TiledTilesetSyncOutcome> outcomes;
+            try
+            {
+                outcomes = TiledTilesetSyncRunner.SyncAll(snapshot, achxPath, tsxPaths);
+            }
+            catch (Exception ex)
+            {
+                TiledSyncFailed?.Invoke(achxPath, ex);
+                return;
+            }
+
+            foreach (var outcome in outcomes)
+            {
+                if (outcome.Success)
+                {
+                    if (outcome.Changed)
+                        TiledSyncSucceeded?.Invoke(outcome.TsxPath, outcome.AppliedCount);
+                }
+                else
+                    TiledSyncFailed?.Invoke(outcome.TsxPath, outcome.Error!);
             }
         }
 
@@ -460,13 +662,20 @@ namespace AnimationEditor.Core.CommandsAndState
                 : new FilePath(_pm.FileName).Extension;
             var defaultExtension = string.IsNullOrEmpty(currentExtension) ? "achj" : currentExtension;
 
-            var path = await FileDialogService.PickSaveFileAsync(
-                "Save Animation Chain", defaultExtension,
-                new[]
+            // A native tsx project's Save As must offer only its own format -- SaveTsxProject
+            // always writes Tiled tileset XML regardless of the target path's extension (see
+            // SaveCurrentAnimationChainList below), so letting the achj/achx choices through here
+            // would let the user save tsx content under a misleading .achx/.achj name.
+            var fileTypeChoices = _pm.IsNativeTsxProject
+                ? new[] { new FileTypeChoice("tsx", "Tiled Tileset (*.tsx)") }
+                : new[]
                 {
                     new FileTypeChoice("achj", "Animation Chain JSON (*.achj)"),
                     new FileTypeChoice("achx", "Animation Chain XML (*.achx)")
-                });
+                };
+
+            var path = await FileDialogService.PickSaveFileAsync(
+                "Save Animation Chain", defaultExtension, fileTypeChoices);
 
             if (string.IsNullOrEmpty(path)) return;
 
@@ -564,7 +773,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void AddAxisAlignedRectangle(AnimationFrameSave frame)
         {
-            if (IsFrameLocked(frame)) return;
+            if (IsFrameLocked(frame) || IsAchxOnlyEditBlocked()) return;
 
             var rectangleSave = new AARectSave
             {
@@ -580,7 +789,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void AddCircle(AnimationFrameSave frame)
         {
-            if (IsFrameLocked(frame)) return;
+            if (IsFrameLocked(frame) || IsAchxOnlyEditBlocked()) return;
 
             var circleSave = new CircleSave
             {
@@ -1234,6 +1443,7 @@ namespace AnimationEditor.Core.CommandsAndState
         public void SetFrameFlip(
             IReadOnlyList<AnimationFrameSave> frames, bool? flipHorizontal, bool? flipVertical, bool? flipDiagonal = null)
         {
+            if (IsAchxOnlyEditBlocked()) return;
             // Absolute set, not toggle: only the frames whose flag actually differs from the target
             // get flipped (and their offset/shapes mirrored), so a frame already at the target state
             // is untouched. Reuses FlipCommand's toggle for exactly those frames, grouped into one
@@ -1266,7 +1476,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void FlipChainHorizontally(AnimationChainSave chain)
         {
-            if (IsChainLocked(chain)) return;
+            if (IsChainLocked(chain) || IsAchxOnlyEditBlocked()) return;
             _undoManager.Execute(new FlipCommand(
                 chain.Frames.ToArray(), FlipAxis.Horizontal, this, _events,
                 () => { RefreshTreeNode(chain); RefreshWireframe(); }));
@@ -1274,7 +1484,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void FlipChainVertically(AnimationChainSave chain)
         {
-            if (IsChainLocked(chain)) return;
+            if (IsChainLocked(chain) || IsAchxOnlyEditBlocked()) return;
             _undoManager.Execute(new FlipCommand(
                 chain.Frames.ToArray(), FlipAxis.Vertical, this, _events,
                 () => { RefreshTreeNode(chain); RefreshWireframe(); }));
@@ -1395,6 +1605,8 @@ namespace AnimationEditor.Core.CommandsAndState
         {
             var acls = _pm.AnimationChainListSave;
             if (acls is null || sources.Count == 0) return Array.Empty<AnimationChainSave>();
+            if (IsAchxOnlyEditBlocked())
+                flipH = flipV = false;
 
             var ordered = sources
                 .OrderBy(c => acls.AnimationChains.IndexOf(c))
@@ -1678,9 +1890,10 @@ namespace AnimationEditor.Core.CommandsAndState
         /// </summary>
         public void NewFile()
         {
-            _pm.AnimationChainListSave = new AnimationChainListSave();
-            _pm.FileName = string.Empty;
-            _pm.OnDiskCoordinateType = FlatRedBall2.AnimationEditorCommon.TextureCoordinateType.Pixel;
+            // ResetToBlankDocument covers AnimationChainListSave/FileName/OnDiskCoordinateType
+            // plus every native-tsx/texture-size/ReferencedPngs tracking field a reused
+            // ProjectManager instance could otherwise leak from the previously-active tab (#1147).
+            _pm.ResetToBlankDocument();
             _selectedState.SelectedChain = null;
             _selectedState.SelectedFrame = null;
             _undoManager.Clear();
@@ -1691,10 +1904,11 @@ namespace AnimationEditor.Core.CommandsAndState
         /// <inheritdoc cref="IAppCommands.CloseProject"/>
         public void CloseProject()
         {
-            _pm.AnimationChainListSave = new AnimationChainListSave();
-            _pm.FileName = null;
+            // See the matching comment in NewFile -- ResetToBlankDocument covers everything a
+            // closed project needs cleared except ProjectFolderPath, which is session-wide (see
+            // its own doc comment) and reset separately here.
+            _pm.ResetToBlankDocument();
             _pm.ProjectFolderPath = null;
-            _pm.OnDiskCoordinateType = FlatRedBall2.AnimationEditorCommon.TextureCoordinateType.Pixel;
             _selectedState.Reset();
             _undoManager.Clear();
             // No content survives a close, so remove any crash-recovery file rather than
@@ -1780,6 +1994,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void SetFrameRelative(IReadOnlyList<AnimationFrameSave> frames, float? newRelX, float? newRelY)
         {
+            if (IsAchxOnlyEditBlocked()) return;
             var unlockedFrames = frames.Where(f => !IsFrameLocked(f)).ToList();
             if (unlockedFrames.Count == 0) return;
             _undoManager.Execute(new BulkFrameEditCommand(
@@ -1796,6 +2011,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void SetFrameColor(IReadOnlyList<AnimationFrameSave> frames, int? red, int? green, int? blue)
         {
+            if (IsAchxOnlyEditBlocked()) return;
             var unlockedFrames = frames.Where(f => !IsFrameLocked(f)).ToList();
             if (unlockedFrames.Count == 0) return;
             // Color tints the preview and the timeline/tree thumbnails but not the wireframe, so no
@@ -1807,6 +2023,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void SetFrameColorOperation(IReadOnlyList<AnimationFrameSave> frames, ColorOperation? operation)
         {
+            if (IsAchxOnlyEditBlocked()) return;
             var unlockedFrames = frames.Where(f => !IsFrameLocked(f)).ToList();
             if (unlockedFrames.Count == 0) return;
             // Mode drives how the preview + timeline/tree thumbnails tint; it doesn't touch the
@@ -1818,6 +2035,7 @@ namespace AnimationEditor.Core.CommandsAndState
 
         public void SetFrameAlpha(IReadOnlyList<AnimationFrameSave> frames, int? alpha)
         {
+            if (IsAchxOnlyEditBlocked()) return;
             var unlockedFrames = frames.Where(f => !IsFrameLocked(f)).ToList();
             if (unlockedFrames.Count == 0) return;
             // Alpha is straight transparency; it fades the preview + timeline/tree thumbnails but not
@@ -1832,8 +2050,26 @@ namespace AnimationEditor.Core.CommandsAndState
         {
             var unlockedFrames = frames.Where(f => !IsFrameLocked(f)).ToList();
             if (unlockedFrames.Count == 0) return;
+
+            // A native tsx chain's frames must all share one whole-tile footprint (see
+            // FrameFootprintSync), so a width/height typed for one frame is the whole chain's new
+            // size: every sibling takes it too, keeping its own X/Y. Same rule the wireframe's
+            // handle drag applies; a move (X/Y only) changes no footprint and propagates nothing.
+            var siblings = new List<AnimationFrameSave>();
+            if (_pm.IsNativeTsxProject && (pixelW.HasValue || pixelH.HasValue))
+            {
+                var edited = new HashSet<AnimationFrameSave>(unlockedFrames, ReferenceEqualityComparer.Instance);
+                siblings = unlockedFrames
+                    .Select(_objectFinder.GetAnimationChainContaining)
+                    .OfType<AnimationChainSave>()
+                    .Distinct<AnimationChainSave>(ReferenceEqualityComparer.Instance)
+                    .SelectMany(c => c.Frames)
+                    .Where(f => !edited.Contains(f))
+                    .ToList();
+            }
+
             _undoManager.Execute(new BulkFrameEditCommand(
-                unlockedFrames, () =>
+                unlockedFrames.Concat(siblings).ToList(), () =>
                 {
                     foreach (var f in unlockedFrames)
                     {
@@ -1842,6 +2078,11 @@ namespace AnimationEditor.Core.CommandsAndState
                         // (possibly just-moved) Left/Top.
                         if (pixelX.HasValue) PixelFrameEditor.SetX(f, pixelX.Value, bmpW);
                         if (pixelY.HasValue) PixelFrameEditor.SetY(f, pixelY.Value, bmpH);
+                        if (pixelW.HasValue) PixelFrameEditor.SetWidth(f, pixelW.Value, bmpW);
+                        if (pixelH.HasValue) PixelFrameEditor.SetHeight(f, pixelH.Value, bmpH);
+                    }
+                    foreach (var f in siblings)
+                    {
                         if (pixelW.HasValue) PixelFrameEditor.SetWidth(f, pixelW.Value, bmpW);
                         if (pixelH.HasValue) PixelFrameEditor.SetHeight(f, pixelH.Value, bmpH);
                     }
@@ -1949,6 +2190,7 @@ namespace AnimationEditor.Core.CommandsAndState
         public void PasteShapes(AnimationFrameSave frame, IReadOnlyList<AARectSave> rectangles,
             IReadOnlyList<CircleSave> circles)
         {
+            if (IsAchxOnlyEditBlocked()) return;
             var clones = BuildShapeClones(frame, rectangles, circles);
             if (clones.Count == 0) return;
             _undoManager.Execute(new PasteShapesCommand(frame, clones, this, _events, _selectedState));
@@ -2040,6 +2282,7 @@ namespace AnimationEditor.Core.CommandsAndState
             IReadOnlyList<AARectSave> rectangles, IReadOnlyList<CircleSave> circles,
             IReadOnlyList<object> sourcesToRemove, AnimationFrameSave sourceFrame)
         {
+            if (IsAchxOnlyEditBlocked()) return;
             var clones = BuildShapeClones(targetFrame, rectangles, circles);
             if (clones.Count == 0) return;
 
@@ -2129,13 +2372,24 @@ namespace AnimationEditor.Core.CommandsAndState
 
             try
             {
-                _pm.LoadAnimationChain(new AnimationEditor.Core.Paths.FilePath(path));
+                // SyncHotReloadWatcher watches whatever IProjectManager.FileName currently is,
+                // tsx or achx/achj alike, with no extension check -- so this must route a tsx
+                // path to LoadTsxProject. LoadAnimationChain's hand-rolled XML parser doesn't
+                // validate the root element name, so it would silently "succeed" against a
+                // tsx's <tileset> root with zero chains instead of throwing.
+                var filePath = new AnimationEditor.Core.Paths.FilePath(path);
+                if (filePath.Extension == "tsx")
+                    _pm.LoadTsxProject(filePath);
+                else
+                    _pm.LoadAnimationChain(filePath);
             }
             catch (Exception ex)
             {
+                _staleOnDiskReasons[new AnimationEditor.Core.Paths.FilePath(path).FullPath] = ex.Message;
                 HotReloadFailed?.Invoke(path, ex.Message);
                 return;
             }
+            _staleOnDiskReasons.Remove(new AnimationEditor.Core.Paths.FilePath(path).FullPath);
 
             _undoManager.Clear();
             _undoManager.MarkSaved();

@@ -2,6 +2,7 @@ using AnimationEditor.Core;
 using AnimationEditor.Core.CommandsAndState;
 using AnimationEditor.Core.CommandsAndState.Commands;
 using AnimationEditor.Core.Data;
+using AnimationEditor.Core.Rendering;
 using AnimationEditor.Core.IO;
 using AnimationEditor.Views.Controls;
 using Avalonia;
@@ -30,10 +31,23 @@ public class AnimationTreeControlTests
     {
         public AnimationChainListSave? AnimationChainListSave { get; set; }
         public TileMapInformationList TileMapInformationList { get; set; } = new();
-        public FilePath[] ReferencedPngs => Array.Empty<FilePath>();
+        public FilePath[] ReferencedPngs { get; set; } = Array.Empty<FilePath>();
         public string? FileName { get; set; }
         public string? ProjectFolderPath { get; set; }
         public TextureCoordinateType OnDiskCoordinateType { get; set; }
+        public bool IsNativeTsxProject => false;
+        public TileGrid? TsxTileGrid => null;
+        public void LoadTsxProject(FilePath fileName) { }
+        public IReadOnlyList<string> SaveTsxProject(string? targetPath = null) => [];
+        public IReadOnlyList<string> GetChainNamesWithTsxIssues() => Array.Empty<string>();
+        public uint? GetTsxOwnerTileId(AnimationChainSave chain) => null;
+        public string? TrySetTsxOwnerTileId(AnimationChainSave chain, uint tileId) => "not a tsx project";
+        public uint? ComputeFrameTileId(AnimationFrameSave frame) => null;
+        public object? CaptureTsxState() => null;
+        public void RestoreTsxState(object? state) { }
+        public object? CaptureTextureSizeState() => null;
+        public void RestoreTextureSizeState(object? state) { }
+        public void ResetToBlankDocument() { }
 
         public void LoadAnimationChain(
             FilePath fileName,
@@ -394,6 +408,69 @@ public class AnimationTreeControlTests
             Dispatcher.UIThread.RunJobs();
 
             Assert.Equal(56, meta.Margin.Right); // locked: clears the lock icon's lane
+        }
+        finally { window.Close(); }
+    }
+
+    /// <summary>
+    /// #1173: hover-reveal must be scoped to the row the pointer is actually over. Previously
+    /// this was anchored on <c>TreeViewItem:pointerover</c>, which Avalonia propagates to every
+    /// visual ancestor under the pointer -- so hovering a frame row (nested inside its expanded
+    /// parent chain's TreeViewItem) also bubbled up and matched the *parent chain's* own hover
+    /// styles, revealing its add-frame/lock buttons and widening its meta text even though the
+    /// pointer was never over the chain header. The fix anchors hover-reveal on the per-row
+    /// content Grid instead (which does not visually contain nested child rows), so hovering a
+    /// frame can never react on its ancestor chain's row, nor on any sibling frame.
+    /// </summary>
+    [AvaloniaFact]
+    public void HoveringFrameRow_DoesNotAffectChainRowOrSiblingFrames()
+    {
+        var (control, _, acls) = Build();
+        var chain = acls.AnimationChains[0]; // "Walk", 2 frames
+        var frame1 = chain.Frames[0];
+        var frame2 = chain.Frames[1];
+
+        var window = new Window { Content = control, Width = 400, Height = 400 };
+        try
+        {
+            window.Show();
+            window.Measure(new Size(400, 400));
+            window.Arrange(new Rect(0, 0, 400, 400));
+            Dispatcher.UIThread.RunJobs();
+
+            var frame1Tvi = control.TreeView.GetVisualDescendants()
+                .OfType<TreeViewItem>()
+                .First(i => i.DataContext is AnimationEditor.Core.ViewModels.TreeNodeVm vm &&
+                            ReferenceEquals(vm.Data, frame1));
+            var local = new Point(frame1Tvi.Bounds.Width / 2, frame1Tvi.Bounds.Height / 2);
+            var windowPoint = frame1Tvi.TranslatePoint(local, window)!.Value;
+            window.MouseMove(windowPoint);
+            Dispatcher.UIThread.RunJobs();
+
+            TextBlock MetaFor(object data) =>
+                control.TreeView.GetVisualDescendants()
+                    .OfType<TextBlock>()
+                    .First(t => t.Classes.Contains("meta") &&
+                                t.DataContext is AnimationEditor.Core.ViewModels.TreeNodeVm vm &&
+                                ReferenceEquals(vm.Data, data));
+
+            Assert.Equal(8, MetaFor(frame1).Margin.Right); // the hovered frame itself: no icons ever appear on it
+            Assert.Equal(8, MetaFor(frame2).Margin.Right); // sibling frame: must not shift just because frame1 is hovered
+            Assert.Equal(8, MetaFor(chain).Margin.Right); // chain header: pointer is not over it, must not shift either
+
+            var chainAddBtn = control.TreeView.GetVisualDescendants()
+                .OfType<Button>()
+                .First(b => b.Classes.Contains("add-frame-btn") &&
+                            b.DataContext is AnimationEditor.Core.ViewModels.TreeNodeVm vm &&
+                            ReferenceEquals(vm.Data, chain));
+            Assert.Equal(0, chainAddBtn.Opacity); // chain's own add-frame button must stay hidden
+
+            var chainLockBtn = control.TreeView.GetVisualDescendants()
+                .OfType<Button>()
+                .First(b => b.Classes.Contains("lock-btn") &&
+                            b.DataContext is AnimationEditor.Core.ViewModels.TreeNodeVm vm &&
+                            ReferenceEquals(vm.Data, chain));
+            Assert.Equal(0, chainLockBtn.Opacity); // chain's own lock button must stay hidden
         }
         finally { window.Close(); }
     }

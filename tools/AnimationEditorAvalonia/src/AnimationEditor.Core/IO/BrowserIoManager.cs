@@ -2,6 +2,9 @@ using AnimationEditor.Core.CommandsAndState;
 using AnimationEditor.Core.Data;
 using FlatRedBall2.AnimationEditorCommon;
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using FilePath = AnimationEditor.Core.Paths.FilePath;
 
@@ -38,6 +41,12 @@ public class BrowserIoManager : IIoManager
     public event Action<string, Exception>? SaveFailed;
     public event Action<AESettingsSave>? SettingsLoaded;
 
+    /// <inheritdoc/>
+    /// <remarks>Only fired from <see cref="AddAssociatedTiledTilesetPathAsync"/> today -- see
+    /// <see cref="GetAssociatedTiledTilesetPaths"/>'s doc comment for why the synchronous read
+    /// path never attempts a parse at all on this implementation.</remarks>
+    public event Action<string, Exception>? TiledSyncParseFailed;
+
     // The browser has no local-temp-file crash-recovery story yet (no filesystem outside a
     // user-granted directory handle) -- these members exist only to satisfy IIoManager and are
     // no-ops. Revisit if/when browser recovery is designed.
@@ -58,6 +67,15 @@ public class BrowserIoManager : IIoManager
         var bareName = achxFile.NoPath;
         var bareNameNoExtension = new FilePath(bareName).RemoveExtension().Original ?? bareName;
         return bareNameNoExtension + ".aeproperties";
+    }
+
+    /// <summary>Same bare-name extension swap as <see cref="GetCompanionFileName"/>, but for the
+    /// <c>.tiledsync</c> companion file (see <see cref="AETiledSyncSave"/>).</summary>
+    internal static string GetTiledSyncCompanionFileName(FilePath achxFile)
+    {
+        var bareName = achxFile.NoPath;
+        var bareNameNoExtension = new FilePath(bareName).RemoveExtension().Original ?? bareName;
+        return bareNameNoExtension + ".tiledsync";
     }
 
     public void SaveCompanionFileFor(FilePath fileName, AESettingsSave settings)
@@ -120,6 +138,69 @@ public class BrowserIoManager : IIoManager
         catch
         {
             return null;
+        }
+    }
+
+    // Running the actual sync (DotTiled reads/writes real .tsx files; see
+    // AnimationEditor.Core/Tiled/) is desktop-only, but the association itself is still stored
+    // here so it round-trips if a project is later opened on desktop -- same store-backed pattern
+    // as the .aeproperties methods above.
+
+    /// <summary>
+    /// Always returns empty -- reading the <c>.tiledsync</c> companion file requires an async
+    /// round trip through <see cref="ICompanionFileStore"/>, which this synchronous method has no
+    /// way to wait on (see <see cref="TryLoadCompanionSettings"/> for the same limitation).
+    /// </summary>
+    public IReadOnlyList<string> GetAssociatedTiledTilesetPaths(string achxFile) => Array.Empty<string>();
+
+    public void AddAssociatedTiledTilesetPath(string achxFile, string tsxFile)
+    {
+        _ = AddAssociatedTiledTilesetPathAsync(achxFile, tsxFile);
+    }
+
+    private async Task AddAssociatedTiledTilesetPathAsync(string achxFile, string tsxFile)
+    {
+        try
+        {
+            var achxFilePath = new FilePath(achxFile);
+            var achxFolder = achxFilePath.GetDirectoryContainingThis();
+            var relativeTsxPath = new FilePath(tsxFile).RelativeTo(achxFolder);
+
+            var companionName = GetTiledSyncCompanionFileName(achxFilePath);
+            var existingJson = await _store.TryReadAsync(companionName);
+            AETiledSyncSave settings;
+            if (existingJson is null)
+            {
+                settings = new AETiledSyncSave();
+            }
+            else
+            {
+                try
+                {
+                    settings = JsonSerializer.Deserialize(existingJson, AETiledSyncJsonContext.Default.AETiledSyncSave)
+                        ?? new AETiledSyncSave();
+                }
+                catch (Exception parseEx)
+                {
+                    // The file exists but is corrupt -- distinct from "no associations yet," which
+                    // the null-check above already handles silently.
+                    TiledSyncParseFailed?.Invoke(achxFile, parseEx);
+                    return;
+                }
+            }
+
+            var alreadyAssociated = settings.TiledTilesetPaths
+                .Any(p => new FilePath(achxFolder.FullPath + p) == new FilePath(tsxFile));
+            if (!alreadyAssociated)
+            {
+                settings.TiledTilesetPaths.Add(relativeTsxPath);
+                var json = JsonSerializer.Serialize(settings, AETiledSyncJsonContext.Default.AETiledSyncSave);
+                await _store.WriteAsync(companionName, json);
+            }
+        }
+        catch (Exception e)
+        {
+            SaveFailed?.Invoke("Could not save Tiled sync companion file " + achxFile + "\n\n" + e, e);
         }
     }
 

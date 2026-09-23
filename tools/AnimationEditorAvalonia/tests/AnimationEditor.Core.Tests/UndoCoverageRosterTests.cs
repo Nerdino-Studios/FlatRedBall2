@@ -41,6 +41,8 @@ public class UndoCoverageRosterTests
     {
         // Mutating, deliberately NOT undoable -------------------------------------
         [nameof(IAppCommands.OpenAchxWorkflowAsync)]              = Category.MutatingNotUndoable, // loads a file; clears the undo stack
+        [nameof(IAppCommands.OpenTsxWorkflowAsync)]               = Category.MutatingNotUndoable, // loads a file; clears the undo stack
+        [nameof(IAppCommands.OpenProjectWorkflowAsync)]           = Category.MutatingNotUndoable, // dispatches to one of the above
         [nameof(IAppCommands.LoadAnimationChain)]                 = Category.MutatingNotUndoable, // loads a file; clears the undo stack
         [nameof(IAppCommands.CaptureTabEditorState)]              = Category.NonMutating,
         [nameof(IAppCommands.RestoreTabSelection)]                = Category.NonMutating,
@@ -53,6 +55,8 @@ public class UndoCoverageRosterTests
         [nameof(IAppCommands.SaveCurrentAnimationChainListAsync)] = Category.MutatingNotUndoable, // writes a file; no model change
         [nameof(IAppCommands.ExportToPixiJsAsync)]                = Category.MutatingNotUndoable, // writes a PixiJS json; no model change
         [nameof(IAppCommands.HandleApplicationClosing)]           = Category.MutatingNotUndoable, // deletes a recovery file; no model change
+        [nameof(IAppCommands.AddAssociatedTiledTileset)]          = Category.MutatingNotUndoable, // writes a companion .tiledsync file; no project model change
+        [nameof(IAppCommands.AddAssociatedTiledTilesetViaDialogAsync)] = Category.MutatingNotUndoable, // dialog + writes a companion .tiledsync file; no project model change
 
         // Non-mutating -----------------------------------------------------------
         [nameof(IAppCommands.RefreshTreeNode)]              = Category.NonMutating,
@@ -134,6 +138,9 @@ public class UndoCoverageRosterTests
         [nameof(IAppCommands.DuplicateSelection)]           = Category.MutatingUndoable,
         [nameof(IAppCommands.SetChainLocked)]               = Category.MutatingUndoable,
         [nameof(IAppCommands.SetChainLoop)]                 = Category.MutatingUndoable,
+        // Undoable (see AppCommandsSetChainTsxOwnerTileIdTests), but excluded from
+        // UndoableInvocations() -- see RoundTripVerifiedElsewhere's doc comment.
+        [nameof(IAppCommands.SetChainTsxOwnerTileId)]       = Category.MutatingUndoable,
 
         // Hot reload — mutates the project but deliberately not undoable (reloads from disk)
         [nameof(IAppCommands.WireHotReloadWatcher)]    = Category.NonMutating,
@@ -166,6 +173,23 @@ public class UndoCoverageRosterTests
             "Roster entries that no longer exist on IAppCommands: " + string.Join(", ", stale));
     }
 
+    /// <summary>
+    /// <see cref="UndoableCommand_RoundTrips"/> proves undo correctness by diffing <c>ctx.Acls</c>
+    /// (the achx model) before/after/undo/redo -- meaningless for a command whose entire mutation
+    /// lives in <see cref="ProjectManager"/>'s native-tsx tracking state (<see
+    /// cref="ProjectManager.TrySetTsxOwnerTileId"/>'s dictionaries), which is deliberately invisible
+    /// to achx serialization (issue #1182 -- that state must never leak into the shared achx/achj
+    /// format). Swapping in a tsx-loaded project mid-invocation would also invalidate the harness's
+    /// "one project, mutated in place" assumption that <c>before</c>/<c>afterCommand</c> diffing
+    /// relies on. Each name here must have its own dedicated round-trip test elsewhere (named in the
+    /// Roster comment next to it) proving Do/Undo/Redo actually round-trip real state -- this is not
+    /// a way to skip verification, only to point it at the right model.
+    /// </summary>
+    private static readonly HashSet<string> RoundTripVerifiedElsewhere = new()
+    {
+        nameof(IAppCommands.SetChainTsxOwnerTileId), // AppCommandsSetChainTsxOwnerTileIdTests
+    };
+
     [Fact]
     public void EveryUndoableMethod_HasARoundTripInvocation()
     {
@@ -173,7 +197,7 @@ public class UndoCoverageRosterTests
         var missing = Roster
             .Where(kv => kv.Value == Category.MutatingUndoable)
             .Select(kv => kv.Key)
-            .Where(name => !invoked.Contains(name))
+            .Where(name => !invoked.Contains(name) && !RoundTripVerifiedElsewhere.Contains(name))
             .ToList();
 
         Assert.True(missing.Count == 0,

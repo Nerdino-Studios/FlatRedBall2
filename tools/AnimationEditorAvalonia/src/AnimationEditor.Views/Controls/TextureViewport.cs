@@ -31,7 +31,7 @@ public class TextureViewportSnapshot
     public int ImageWidth, ImageHeight;
     public float PanX, PanY, Zoom;
     public bool ShowGrid;
-    public int GridSize;
+    public TileGrid Grid;
     public double Width, Height;
 
     /// <summary>
@@ -158,7 +158,7 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
                 canvas.DrawRect(dest, outlinePaint);
 
                 // Grid overlay
-                if (s.ShowGrid && s.GridSize > 0)
+                if (s.ShowGrid && s.Grid.IsValid)
                     DrawGrid(canvas, s, dest, palette);
             }
 
@@ -192,19 +192,21 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
                 StrokeWidth  = 1f,
                 IsAntialias  = true
             };
-            float step = s.GridSize * s.Zoom;
-            if (step < 1f) step = 1f;
+            // One line per cell start (cell + spacing apart); margin only shifts the origin. The
+            // lines stay locked to the texture origin (PanX/PanY) either way.
+            float stepX = MathF.Max(1f, s.Grid.StrideX * s.Zoom);
+            float stepY = MathF.Max(1f, s.Grid.StrideY * s.Zoom);
 
             // Full viewport (not just textureDest) so empty canvas around the sheet still shows
-            // the grid — lines stay locked to the texture origin (PanX/PanY).
+            // the grid.
             float viewL = 0f, viewT = 0f, viewR = (float)s.Width, viewB = (float)s.Height;
-            float originX = s.PanX;
-            float originY = s.PanY;
+            float originX = s.PanX + s.Grid.Margin * s.Zoom;
+            float originY = s.PanY + s.Grid.Margin * s.Zoom;
 
             // n = how many grid steps this line sits from the texture origin (PanX/PanY). The
             // major/minor pattern must key off n, not off "which line is first visible" — the
             // latter shifts the pattern's phase every time the camera pans (#701).
-            (float pos, int n) FirstLine(float origin, float viewMin)
+            (float pos, int n) FirstLine(float origin, float viewMin, float step)
             {
                 int n = (int)MathF.Ceiling((viewMin - origin) / step);
                 return (origin + n * step, n);
@@ -217,8 +219,8 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
             // this division is exact regardless of sign.
             bool IsMajorVisible(int n) => GridFadeCalculator.IsMajorLineVisible(n / MajorGridLineInterval, s.Zoom);
 
-            var (xStart, xIndex) = FirstLine(originX, viewL);
-            for (float x = xStart; x <= viewR; x += step, xIndex++)
+            var (xStart, xIndex) = FirstLine(originX, viewL, stepX);
+            for (float x = xStart; x <= viewR; x += stepX, xIndex++)
             {
                 bool major = IsMajor(xIndex);
                 if (major && !IsMajorVisible(xIndex)) continue;
@@ -226,8 +228,8 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
                     canvas.DrawLine(x, viewT, x, viewB, major ? majorPaint : minorPaint);
             }
 
-            var (yStart, yIndex) = FirstLine(originY, viewT);
-            for (float y = yStart; y <= viewB; y += step, yIndex++)
+            var (yStart, yIndex) = FirstLine(originY, viewT, stepY);
+            for (float y = yStart; y <= viewB; y += stepY, yIndex++)
             {
                 bool major = IsMajor(yIndex);
                 if (major && !IsMajorVisible(yIndex)) continue;
@@ -273,7 +275,7 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
     private readonly ZoomAnimator _zoomAnimator;
 
     protected bool _showGrid;
-    protected int _gridSize = 16;
+    protected TileGrid _grid = TileGrid.Uniform(16);
 
     // Set when LoadTexture/CenterTexture ran before the control had a real viewport
     // (Bounds not yet laid out); the first SizeChanged with valid Bounds re-centers.
@@ -768,11 +770,15 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
         ZoomToward((float)Bounds.Width / 2f, (float)Bounds.Height / 2f, newZoom / _zoom);
     }
 
-    /// <summary>Toggle the grid overlay and update the grid cell size.</summary>
-    public void SetGrid(bool show, int cellSize)
+    /// <summary>Toggle the grid overlay and set a plain square grid of <paramref name="cellSize"/>.</summary>
+    public void SetGrid(bool show, int cellSize) => SetGrid(show, TileGrid.Uniform(cellSize));
+
+    /// <summary>Toggle the grid overlay and set its full geometry -- a native tsx project's tile
+    /// grid carries the tileset's margin and spacing, which also drive snapping.</summary>
+    public void SetGrid(bool show, TileGrid grid)
     {
         _showGrid = show;
-        _gridSize = cellSize;
+        _grid = grid;
         InvalidateVisual();
     }
 
@@ -792,7 +798,10 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
     }
 
     /// <summary>Current grid show/size state. For tests.</summary>
-    public (bool ShowGrid, int GridSize) GridState => (_showGrid, _gridSize);
+    public (bool ShowGrid, int GridSize) GridState => (_showGrid, _grid.CellWidth);
+
+    /// <summary>Full grid geometry, including a tsx tileset's margin/spacing. For tests.</summary>
+    public TileGrid Grid => _grid;
 
     /// <summary>Camera state (panX, panY, zoom). panX/panY are the screen position of texture
     /// pixel (0,0): screenX = panX + textureX × zoom.</summary>
@@ -944,11 +953,14 @@ public class TextureViewport : Control, IZoomTarget, IPanScrollTarget
         snap.Image       = _image;
         snap.ImageWidth  = _bitmap?.Width ?? 0;
         snap.ImageHeight = _bitmap?.Height ?? 0;
-        snap.PanX        = _panX;
-        snap.PanY        = _panY;
+        // Snapped for render (issue #1140 follow-up) -- the live _panX/_panY stay full precision
+        // so repeated fit/clamp/zoom math never accumulates rounding error; only what's actually
+        // drawn (and the frame-box overlay, via TextureRectToScreen using this same snapshot) is
+        // snapped, so the image, grid, outline, and overlay all move together.
+        (snap.PanX, snap.PanY) = CanvasTransform.SnapPanForPointSampling(_panX, _panY, _zoom);
         snap.Zoom        = _zoom;
         snap.ShowGrid    = _showGrid;
-        snap.GridSize    = _gridSize;
+        snap.Grid        = _grid;
         snap.Width       = width;
         snap.Height      = height;
     }

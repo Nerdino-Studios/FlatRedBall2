@@ -1,3 +1,4 @@
+using AnimationEditor.Core.Rendering;
 using AnimationEditor.Core.CommandsAndState.Commands;
 using AnimationEditor.Core.Paths;
 using FlatRedBall2.AnimationEditorCommon;
@@ -68,6 +69,31 @@ namespace AnimationEditor.Core.Models
         /// captured. Used to detect external edits while the tab was in the background.
         /// </summary>
         public DateTime? CachedDiskWriteTimeUtc { get; set; }
+
+        /// <summary>
+        /// Snapshot of this tab's native-tsx state (see <see cref="IProjectManager.CaptureTsxState"/>),
+        /// captured alongside <see cref="CachedEditorModel"/> so a cache-hit tab switch restores
+        /// <see cref="IProjectManager.IsNativeTsxProject"/>/<see cref="IProjectManager.TsxTileGrid"/>
+        /// for THIS tab instead of leaving whatever tab was loaded last. Null for an achx/achj tab.
+        /// </summary>
+        public object? CachedTsxState { get; set; }
+
+        /// <summary>
+        /// Snapshot of this tab's known texture sizes (see
+        /// <see cref="IProjectManager.CaptureTextureSizeState"/>), captured alongside
+        /// <see cref="CachedEditorModel"/> so a cache-hit tab switch restores THIS tab's texture
+        /// sizes on the browser-wasm build instead of leaving whatever tab was loaded last. Null
+        /// when no known texture sizes were supplied for this tab.
+        /// </summary>
+        public object? CachedTextureSizeState { get; set; }
+
+        /// <summary>
+        /// Snapshot of <see cref="IProjectManager.ReferencedPngs"/>, captured alongside
+        /// <see cref="CachedEditorModel"/> so a cache-hit tab switch restores THIS tab's
+        /// project-referenced PNGs (used by the texture-picker dropdown) instead of leaving
+        /// whatever tab was loaded last. Empty (not null) when this tab has no linked project.
+        /// </summary>
+        public FilePath[] CachedReferencedPngs { get; set; } = Array.Empty<FilePath>();
 
         /// <summary>
         /// Name of the selected animation chain when this tab was last deactivated.
