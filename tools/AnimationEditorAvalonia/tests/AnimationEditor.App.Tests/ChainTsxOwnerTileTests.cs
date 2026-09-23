@@ -29,7 +29,10 @@ public class ChainTsxOwnerTileTests : IDisposable
 
     // 4 columns, 16x16 tiles, 8 rows (tilecount=32, image 64x128). "RiseUp" is owned by tile 9,
     // but frame 0 is tile 8 (the "owner not first frame" pattern -- issue #1182's real repro).
-    // "Idle" is a second chain owned by tile 20. Tile 16 is blank/unused.
+    // "Idle" is a second chain owned by tile 20. Tile 5 has no Name property, so it loads as chain
+    // name "ID:5" (TiledAnimationToAchjMapper's synthetic placeholder) -- owned by tile 5, but
+    // frame 0 is tile 6, same "owner not first frame" shape as RiseUp, so Sync has somewhere to
+    // move it to. Tile 16 is blank/unused.
     private const string TsxFixtureXml = """
         <?xml version="1.0" encoding="UTF-8"?>
         <tileset version="1.10" tiledversion="1.12.2" name="Heroes" tilewidth="16" tileheight="16" tilecount="32" columns="4">
@@ -49,6 +52,12 @@ public class ChainTsxOwnerTileTests : IDisposable
           </properties>
           <animation>
            <frame tileid="20" duration="200"/>
+          </animation>
+         </tile>
+         <tile id="5">
+          <animation>
+           <frame tileid="6" duration="150"/>
+           <frame tileid="7" duration="150"/>
           </animation>
          </tile>
         </tileset>
@@ -188,6 +197,95 @@ public class ChainTsxOwnerTileTests : IDisposable
 
             var onDisk = Disk(_tsxPath);
             Assert.Equal([((uint)8, 300), ((uint)12, 300)], onDisk.Tiles.Single(t => t.ID == 8).Animation.Select(f => (f.TileID, f.Duration)));
+        }
+        finally { window.Close(); }
+    }
+
+    // Regression: an unnamed chain's tree label ("ID:{oldTileId}", TiledAnimationToAchjMapper's
+    // synthetic placeholder) went stale after Sync moved the owner tile -- driven through the real
+    // MainWindow/tree pipeline, not just ProjectManager.TrySetTsxOwnerTileId's own Core.Tests
+    // coverage, since the actual report was "the tree view doesn't update".
+    [AvaloniaFact]
+    public void ClickingSyncButton_OnUnnamedChain_RenamesTreeNodeToNewSyntheticId()
+    {
+        var (window, ctx) = OpenTsx();
+        try
+        {
+            var chain = ctx.ProjectManager.AnimationChainListSave!.AnimationChains.Single(c => c.Name == "ID:5");
+            ctx.SelectedState.SelectedChain = chain;
+            Dispatcher.UIThread.RunJobs();
+
+            var tree = window.FindControl<TreeView>("AnimTree")!;
+            var roots = (System.Collections.ObjectModel.ObservableCollection<AnimationEditor.Core.ViewModels.TreeNodeVm>)tree.ItemsSource!;
+            var node = roots.Single(r => ReferenceEquals(r.Data, chain));
+            Assert.Equal("ID:5", node.Header);
+
+            var syncButton = window.FindControl<Button>("PropChainTsxOwnerSyncButton")!;
+            syncButton.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+            Dispatcher.UIThread.RunJobs();
+
+            Assert.Equal("ID:6", chain.Name);
+            Assert.Equal("ID:6", node.Header); // the tree label must follow, same TreeNodeVm instance
+        }
+        finally { window.Close(); }
+    }
+
+    // False-match guard, driven through the real UI: a manual rename to text that happens to LOOK
+    // like the synthetic placeholder ("ID:999") must still count as a real name -- Sync must never
+    // silently overwrite it, in the tree label or the underlying chain.
+    [AvaloniaFact]
+    public void ManualRename_ToTextThatLooksSynthetic_ThenClickingSyncButton_LeavesItUntouched()
+    {
+        var (window, ctx) = OpenTsx();
+        try
+        {
+            var chain = ctx.ProjectManager.AnimationChainListSave!.AnimationChains.Single(c => c.Name == "ID:5");
+            ctx.SelectedState.SelectedChain = chain;
+            Dispatcher.UIThread.RunJobs();
+
+            Assert.True(ctx.AppCommands.RenameChain(chain, "ID:999"));
+            Dispatcher.UIThread.RunJobs();
+
+            var syncButton = window.FindControl<Button>("PropChainTsxOwnerSyncButton")!;
+            syncButton.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+            Dispatcher.UIThread.RunJobs();
+
+            Assert.Equal("ID:999", chain.Name);
+
+            var tree = window.FindControl<TreeView>("AnimTree")!;
+            var roots = (System.Collections.ObjectModel.ObservableCollection<AnimationEditor.Core.ViewModels.TreeNodeVm>)tree.ItemsSource!;
+            var node = roots.Single(r => ReferenceEquals(r.Data, chain));
+            Assert.Equal("ID:999", node.Header);
+        }
+        finally { window.Close(); }
+    }
+
+    // Regression for the sync button's two reported problems: (1) no indication of already-synced
+    // state, (2) repeated clicks pushing a spurious undo entry each time.
+    [AvaloniaFact]
+    public void SyncButton_ShowsTargetTileAndDisablesOnceSynced_RepeatedClickPushesNoExtraUndo()
+    {
+        var (window, ctx) = OpenTsx();
+        try
+        {
+            var chain = ctx.ProjectManager.AnimationChainListSave!.AnimationChains.Single(c => c.Name == "RiseUp");
+            ctx.SelectedState.SelectedChain = chain;
+            Dispatcher.UIThread.RunJobs();
+
+            var syncButton = window.FindControl<Button>("PropChainTsxOwnerSyncButton")!;
+            Assert.True(syncButton.IsEnabled); // owner is tile 9, frame 0 is tile 8 -- not yet synced
+            Assert.Contains("8", syncButton.Content?.ToString());
+
+            syncButton.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+            Dispatcher.UIThread.RunJobs();
+
+            Assert.Single(ctx.UndoManager.UndoHistory);
+            Assert.False(syncButton.IsEnabled); // now synced to tile 8 -- nothing left to sync
+
+            syncButton.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+            Dispatcher.UIThread.RunJobs();
+
+            Assert.Single(ctx.UndoManager.UndoHistory); // repeated click pushed no extra entry
         }
         finally { window.Close(); }
     }

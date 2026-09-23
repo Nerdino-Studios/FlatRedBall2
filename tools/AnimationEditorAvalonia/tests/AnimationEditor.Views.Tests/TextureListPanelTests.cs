@@ -35,6 +35,8 @@ public class TextureListPanelTests
         public IReadOnlyList<string> GetChainNamesWithTsxIssues() => Array.Empty<string>();
         public uint? GetTsxOwnerTileId(AnimationChainSave chain) => null;
         public string? TrySetTsxOwnerTileId(AnimationChainSave chain, uint tileId) => "not a tsx project";
+        public bool IsTsxOwnerTileIdAlreadySet(AnimationChainSave chain, uint tileId) => false;
+        public bool MarkChainNameExplicit(AnimationChainSave chain) => false;
         public uint? ComputeFrameTileId(AnimationFrameSave frame) => null;
         public object? CaptureTsxState() => null;
         public void RestoreTsxState(object? state) { }

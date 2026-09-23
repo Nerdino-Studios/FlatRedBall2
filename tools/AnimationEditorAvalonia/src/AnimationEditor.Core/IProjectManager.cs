@@ -66,6 +66,16 @@ namespace AnimationEditor.Core
         /// to. See <see cref="ProjectManager.TrySetTsxOwnerTileId"/>.</summary>
         string? TrySetTsxOwnerTileId(AnimationChainSave chain, uint tileId);
 
+        /// <summary>True when calling <see cref="TrySetTsxOwnerTileId"/> with these exact
+        /// arguments would be a pure no-op -- the chain is already pinned to <paramref
+        /// name="tileId"/> with no satellite hints left to drop. See <see
+        /// cref="ProjectManager.IsTsxOwnerTileIdAlreadySet"/>.</summary>
+        bool IsTsxOwnerTileIdAlreadySet(AnimationChainSave chain, uint tileId);
+
+        /// <summary>Marks a chain's name as real (no longer the synthetic "ID:{tileId}"
+        /// placeholder). See <see cref="ProjectManager.MarkChainNameExplicit"/>.</summary>
+        bool MarkChainNameExplicit(AnimationChainSave chain);
+
         /// <summary>The Tiled tile id a frame's own pixel rect resolves to. See <see
         /// cref="ProjectManager.ComputeFrameTileId"/>.</summary>
         uint? ComputeFrameTileId(AnimationFrameSave frame);
