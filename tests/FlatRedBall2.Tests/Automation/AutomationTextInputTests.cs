@@ -184,7 +184,12 @@ public class AutomationGumInputInstallTests
         finally
         {
             engine.Shutdown();
-            Gum.Forms.FormsUtilities.SetKeyboard(previousKeyboard);
+            // Gum has no public way back to "no keyboard", so a run that started without one keeps ours.
+            if (previousKeyboard != null)
+            {
+                Gum.Forms.FormsUtilities.SetKeyboard(previousKeyboard);
+            }
+
             Gum.Forms.FormsUtilities.SetCursor(previousCursor);
         }
     }
@@ -221,10 +226,11 @@ public class AutomationGumInputInstallTests
             Gum.Forms.FormsUtilities.Keyboard.ShouldBeSameAs(mode.GumKeyboard);
             Gum.Forms.FormsUtilities.Cursor.ShouldBeSameAs(mode.GumCursor);
 
-            // Stands in for FormsUtilities.InitializeDefaults / Uninitialize, either of which
-            // overwrites both fields depending on when the game calls Initialize.
-            Gum.Forms.FormsUtilities.SetKeyboard(null!);
-            Gum.Forms.FormsUtilities.SetCursor(null!);
+            // Stands in for FormsUtilities.InitializeDefaults, which overwrites both fields
+            // depending on when the game calls Initialize.
+            var other = new AutomationMode(new FlatRedBallService(), new StringWriter());
+            Gum.Forms.FormsUtilities.SetKeyboard(other.GumKeyboard);
+            Gum.Forms.FormsUtilities.SetCursor(other.GumCursor);
             mode.EnsureGumInputInstalled();
 
             Gum.Forms.FormsUtilities.Keyboard.ShouldBeSameAs(mode.GumKeyboard);
@@ -232,7 +238,12 @@ public class AutomationGumInputInstallTests
         }
         finally
         {
-            Gum.Forms.FormsUtilities.SetKeyboard(previousKeyboard);
+            // Gum has no public way back to "no keyboard", so a run that started without one keeps ours.
+            if (previousKeyboard != null)
+            {
+                Gum.Forms.FormsUtilities.SetKeyboard(previousKeyboard);
+            }
+
             Gum.Forms.FormsUtilities.SetCursor(previousCursor);
         }
     }

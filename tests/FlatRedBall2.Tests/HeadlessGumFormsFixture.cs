@@ -44,7 +44,7 @@ public sealed class HeadlessGumFormsFixture : IDisposable
     private readonly InteractiveGue? _previousModalRoot = Gum.Forms.Controls.FrameworkElement.ModalRoot;
     private readonly Gum.Forms.DefaultVisuals.V3.Styling? _previousStyle = Gum.Forms.DefaultVisuals.V3.Styling.ActiveStyle;
     private readonly VisualOverBehavior _previousVisualOverBehavior = Gum.Wireframe.ICursor.VisualOverBehavior;
-    private readonly Action<IRenderableIpso, GraphicalUiElement, string, object?>? _previousSetProperty = GraphicalUiElement.SetPropertyOnRenderable;
+    private readonly Func<IRenderableIpso, GraphicalUiElement, string, object?, bool>? _previousSetProperty = GraphicalUiElement.SetPropertyOnRenderable;
     private readonly float _previousCanvasWidth = GraphicalUiElement.CanvasWidth;
     private readonly float _previousCanvasHeight = GraphicalUiElement.CanvasHeight;
 
@@ -135,7 +135,12 @@ public sealed class HeadlessGumFormsFixture : IDisposable
         GraphicalUiElement.CanvasHeight = _previousCanvasHeight;
         Text.DefaultBitmapFont = _previousFont!;
         FormsUtilities.SetCursor(_previousCursor!);
-        FormsUtilities.SetKeyboard(_previousKeyboard!);
+        // Gum has no public way back to "no keyboard", so a run that started without one keeps ours.
+        if (_previousKeyboard != null)
+        {
+            FormsUtilities.SetKeyboard(_previousKeyboard);
+        }
+
         IGumService.Default = _previousService!;
     }
 }

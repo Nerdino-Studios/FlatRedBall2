@@ -18,8 +18,7 @@ namespace FlatRedBall2.Automation;
 /// from <c>GetStringTyped</c> come exclusively from the OS <c>GameWindow.TextInput</c> event, via
 /// a private buffer, and that path has no injection seam. This type replaces it wholesale through
 /// <c>FormsUtilities.SetKeyboard</c> and sources everything from <see cref="InputManager"/>
-/// instead — the same injected state the <c>input type:key</c> command already writes. See
-/// design/gum-text-input-seam.md.
+/// instead — the same injected state the <c>input type:key</c> command already writes.
 /// <para>
 /// Key state is read live from the FRB2 keyboard; typed text is buffered and released one frame
 /// at a time by <see cref="Activity"/>, mirroring how Gum's keyboard promotes its window buffer.
