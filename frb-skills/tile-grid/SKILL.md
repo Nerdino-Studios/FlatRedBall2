@@ -8,6 +8,7 @@ description: "Programmatic tile grid in FlatRedBall2. Use when building a code-d
 Use this skill when the grid is created at runtime in C#, not loaded from a `.tmx` file. Typical cases: city builders, procedural dungeons, puzzle games, cellular automata.
 
 If you have a designer-authored level in Tiled, use the **levels** and **tmx** skills instead.
+For axial pointy-top or flat-top cells, use the **hex-grid** skill; the square-grid coordinate arithmetic below does not apply.
 
 ---
 
