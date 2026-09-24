@@ -1267,7 +1267,11 @@ public class FlatRedBallService
     public InputManager Input { get; } = new InputManager();
     /// <summary>Sound effect and music playback service.</summary>
     public AudioManager Audio { get; } = new AudioManager();
-    /// <summary>The active screen's content loader. Auto-recreated each screen change.</summary>
+    /// <summary>
+    /// The engine-level content loader, initialized once in <see cref="Initialize(Game, EngineInitSettings)"/> and
+    /// never unloaded by a screen change. Content that must outlive screens (shared textures, atlases) belongs here;
+    /// per-screen content goes through <see cref="Screen.ContentLoader"/>, which is unloaded on transition.
+    /// </summary>
     public ContentLoader Content { get; } = new ContentLoader();
     /// <summary>Engine clocks and async delay primitives. See <see cref="TimeManager"/>.</summary>
     public TimeManager Time { get; } = new TimeManager();
