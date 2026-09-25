@@ -1445,8 +1445,12 @@ public class FlatRedBallService
             {
                 // An armed screenshot still needs one draw to capture — suppressing every
                 // ungranted tick would starve it, since no further step is coming.
+                //
+                // Null-conditional, not null-forgiving: a headless engine (no Initialize, as in
+                // the Screen/automation tests) has no Game to suppress, and there is no draw to
+                // suppress either, so an ungranted tick is a plain no-op rather than a crash.
                 if (!_automationMode.HasPendingScreenshot)
-                    _game!.SuppressDraw();
+                    _game?.SuppressDraw();
                 return;
             }
         }
@@ -1470,6 +1474,12 @@ public class FlatRedBallService
         long tInput = System.Diagnostics.Stopwatch.GetTimestamp();
         Input.Update(Time.UnscaledTimeSinceStart);
         _frameProfile.InputMs = ProfileClock.Ms(tInput, System.Diagnostics.Stopwatch.GetTimestamp());
+
+        // Input state for this frame is now current, so point Gum Forms at it before anything
+        // hit-tests the cursor or reads the focused control. Deliberately outside the
+        // _spriteBatch guard below: the install is pure state and must not depend on a graphics
+        // device existing.
+        _automationMode?.EnsureGumInputInstalled();
 
         _frameProfile.AudioMs = 0;
         _frameProfile.GumUpdateMs = 0;
