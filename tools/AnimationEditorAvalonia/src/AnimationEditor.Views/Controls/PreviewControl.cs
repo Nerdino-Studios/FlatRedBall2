@@ -3267,6 +3267,25 @@ public class PreviewControl : Control, IZoomTarget, IPanScrollTarget, IWheelInpu
         return path;
     }
 
+    // Normal shapes first, then selected, then hovered, so the shape being edited isn't buried
+    // under its neighbors' outlines. Stable within a tier.
+    internal static PreviewShapeInfo[] ShapeDrawOrder(PreviewShapeInfo[] shapes) =>
+        shapes.OrderBy(sh => sh.IsHovered ? 2 : sh.IsSelected ? 1 : 0).ToArray();
+
+    // Small "+" at the polygon's X/Y, which its vertices are relative to (#1352). A fixed screen
+    // size and a dark underlay so it reads at any zoom and over any texture.
+    private static void DrawPolygonOrigin(SKCanvas canvas, float x, float y)
+    {
+        const float arm = 6f;
+        using var underlay = new SKPaint { Color = EditorColors.PolygonOriginUnderlay, Style = SKPaintStyle.Stroke, StrokeWidth = 3f };
+        using var cross    = new SKPaint { Color = EditorColors.PolygonOrigin, Style = SKPaintStyle.Stroke, StrokeWidth = 1f };
+        foreach (var paint in new[] { underlay, cross })
+        {
+            canvas.DrawLine(x - arm, y, x + arm, y, paint);
+            canvas.DrawLine(x, y - arm, x, y + arm, paint);
+        }
+    }
+
     // Filled squares on the vertices; hollow dots on the edge midpoints (press one to add a vertex).
     private static void DrawPolygonHandles(SKCanvas canvas, PreviewShapeInfo sh, float originX, float originY, float om)
     {
@@ -3391,7 +3410,7 @@ public class PreviewControl : Control, IZoomTarget, IPanScrollTarget, IWheelInpu
             using var shapePaint   = new SKPaint { Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f, IsAntialias = true };
             using var selectedPaint = new SKPaint { Style = SKPaintStyle.Stroke, StrokeWidth = 2f,   IsAntialias = true };
 
-            foreach (var sh in s.Shapes)
+            foreach (var sh in ShapeDrawOrder(s.Shapes))
             {
                 var paint = sh.IsSelected || sh.IsHovered ? selectedPaint : shapePaint;
                 paint.Color = sh.IsSelected
@@ -3410,6 +3429,8 @@ public class PreviewControl : Control, IZoomTarget, IPanScrollTarget, IWheelInpu
                         paint.Color = EditorColors.InvalidShape;
                     using var path = BuildPolygonPath(sh, sx, sy, om);
                     canvas.DrawPath(path, paint);
+                    if (sh.IsSelected)
+                        DrawPolygonOrigin(canvas, sx, sy);
                     if (sh.IsSelected && !sh.IsLocked)
                         DrawPolygonHandles(canvas, sh, sx, sy, om);
                 }
