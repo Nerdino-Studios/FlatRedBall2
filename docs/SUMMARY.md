@@ -11,6 +11,7 @@
 * [How-To Guides](animationeditor/how-to/README.md)
   * [Edit Animations](animationeditor/how-to/edit-animations.md)
   * [Edit Frames](animationeditor/how-to/edit-frames.md)
+  * [Preview an Animation](animationeditor/how-to/preview-an-animation.md)
   * [Work with Project Folders](animationeditor/how-to/work-with-project-folders.md)
 * [Code](animationeditor/api/README.md)
   * [Animations in MonoGame](animationeditor/api/loading-and-drawing-achx-animations.md)
