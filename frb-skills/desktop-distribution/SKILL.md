@@ -1,6 +1,7 @@
 ---
 name: desktop-distribution
-description: Shipping a desktop FRB2 build — self-contained per-RID publish and the macOS .app layout. Triggers: PublishProfile, SelfContained, RuntimeIdentifier, osx-arm64, Contents/MacOS, Contents/Resources.
+description: >-
+  Shipping a desktop FRB2 build — self-contained per-RID publish and the macOS .app layout. Triggers: PublishProfile, SelfContained, RuntimeIdentifier, osx-arm64, Contents/MacOS, Contents/Resources.
 ---
 
 # Desktop Distribution
