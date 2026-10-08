@@ -1,6 +1,6 @@
 ---
 name: performance
-description: FlatRedBallService.Performance — opt-in rolling FPS/timing/collision stats; StartupProfiler for one-time boot/load timing. Triggers: PerformanceMonitor, GenerateReport, FPS, frame time, DeepCollisionCount, StartupProfiler, ProfileStartup, "why is my game slow", "slow to load", measuring a browser/WASM build, "click didn't register".
+description: "FlatRedBallService.Performance — opt-in rolling FPS/timing/collision stats; StartupProfiler for one-time boot/load timing. Triggers: PerformanceMonitor, GenerateReport, FPS, frame time, DeepCollisionCount, StartupProfiler, ProfileStartup, \"why is my game slow\", \"slow to load\", measuring a browser/WASM build, \"click didn't register\"."
 ---
 
 # Performance Monitoring
