@@ -26,11 +26,11 @@ An animation can be viewed by clicking on the frame in the animation list, or by
 
 If multiple animations are selected, then the AnimationEditor displays both animations in the preview. Animations selected last draw on top.
 
-<figure><img src="/broken/files/8FrQYISbtKT657sud0Qb" alt=""><figcaption><p>Multiple selected animations overlapping</p></figcaption></figure>
+<figure><img src="../../.gitbook/assets/08_09_12_18.gif" alt=""><figcaption><p>Multiple selected animations overlapping</p></figcaption></figure>
 
 Animations can be individually started/stopped through the timeline, either by clicking on a frame or pause button.
 
-<figure><img src="/broken/files/ENwLRfrDriyyg8WRmIKQ" alt=""><figcaption><p>Stopping/starting animations per timeline</p></figcaption></figure>
+<figure><img src="../../.gitbook/assets/08_09_13_37.gif" alt=""><figcaption><p>Stopping/starting animations per timeline</p></figcaption></figure>
 
 
 
